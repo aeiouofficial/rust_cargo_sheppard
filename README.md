@@ -1,4 +1,4 @@
-# 🐑 rust_cargo_sheppard_win
+# 🐑 rust_cargo_sheppard
 
 <img width="1536" height="1024" alt="aa6d2fbc-f767-49bd-b4a7-dca177b4b5d1" src="https://github.com/user-attachments/assets/33bc3d80-c748-43b8-8a98-71f0389a8f59" />
 
