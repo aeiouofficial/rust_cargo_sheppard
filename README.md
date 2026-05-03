@@ -71,6 +71,9 @@ The daemon runs a **true priority scheduler**: five priority levels (Background 
 | **sccache integration** | Pairs with Mozilla's compiler cache to share artifacts across projects |
 | **Cross-platform** | Windows (Named Pipes), macOS/Linux (Unix Sockets) — same binary |
 
+
+<img width="1254" height="334" alt="taskbar_preview" src="https://github.com/user-attachments/assets/34e4ac6d-0812-45e6-9c8d-5b7c5075c91d" />
+
 ---
 
 ## Quick Start
