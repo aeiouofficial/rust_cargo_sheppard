@@ -94,6 +94,15 @@ shepherd tui
 
 # 5. See all active builds from the CLI
 shepherd status
+
+if thats too complicated for whatever reason for you, you also can use the bats:
+All paths are RELATIVE — works when downloaded on any PC/drive (no hardcoded paths).
+
+Workflow for sheps:
+
+First time: double-click bin/build_shepherd.bat
+
+when download + build finished = .exe gets created (you dont start the app with it)
 ```
 
 ---
@@ -152,16 +161,6 @@ The project is structured for modularity and cross-platform compatibility:
 - `src/runner.rs` : Cargo process management and output streaming.
 - `src/tui.rs` : Ratatui-based dashboard.
 
----
-All paths are RELATIVE — works when downloaded on any PC/drive (no hardcoded paths).
-
-Workflow for users:
-
-First time: double-click bin/build_shepherd.bat
-
-when download + build finished = .exe gets created (you dont start the app with it)
-
-Then: double-click start_shepherd.bat to run the app (daemon + TUI)
 ---
 ## License
 
