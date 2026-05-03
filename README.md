@@ -1,6 +1,6 @@
 # 🐑 cargo-shepherd
 
-<img width="1254" height="1254" alt="c71c963e-326e-4349-ab63-1c3816721d1b" src="https://github.com/user-attachments/assets/8682c37f-0d08-426a-a276-84abc76fa34d" />
+<img width="1536" height="1024" alt="aa6d2fbc-f767-49bd-b4a7-dca177b4b5d1" src="https://github.com/user-attachments/assets/98f04c4c-9ae5-4a6d-8473-d36e4635c645" />
 
 
 > **A system-wide Cargo build coordinator for Windows 10/11, macOS, and Linux.**  
