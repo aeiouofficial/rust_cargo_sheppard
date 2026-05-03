@@ -2,6 +2,8 @@
 
 <img width="1536" height="1024" alt="aa6d2fbc-f767-49bd-b4a7-dca177b4b5d1" src="https://github.com/user-attachments/assets/98f04c4c-9ae5-4a6d-8473-d36e4635c645" />
 
+<img width="969" height="548" alt="image" src="https://github.com/user-attachments/assets/6ae13a75-9dd1-4ca0-af25-afad95f893b6" />
+
 
 > **A system-wide Cargo build coordinator for Windows 10/11, macOS, and Linux.**  
 > Prevents multiple Rust projects open in parallel VSCode windows from fighting each other, maxing out your CPU/RAM, and deadlocking on Cargo's file locks — with a full interactive TUI dashboard and persistent per-project configuration.
