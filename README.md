@@ -153,7 +153,16 @@ The project is structured for modularity and cross-platform compatibility:
 - `src/tui.rs` : Ratatui-based dashboard.
 
 ---
+All paths are RELATIVE — works when downloaded on any PC/drive (no hardcoded paths).
 
+Workflow for users:
+
+First time: double-click bin/build_shepherd.bat
+
+when download + build finished = .exe gets created (you dont start the app with it)
+
+Then: double-click start_shepherd.bat to run the app (daemon + TUI)
+---
 ## License
 
 MIT - see [LICENSE](LICENSE)
