@@ -19,13 +19,11 @@ use std::time::Instant;
 use anyhow::Result;
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, Notify, mpsc};
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tracing::{error, info};
 
-use crate::config::GlobalConfig;
-use crate::ipc::{
-    socket_path, ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, StatusReport,
-};
+use crate::config::{slot_limit_label, GlobalConfig};
+use crate::ipc::{ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, StatusReport};
 use crate::monitor::ResourceMonitor;
 use crate::queue::{PriorityQueue, QueuedJob};
 use crate::runner::CargoRunner;
@@ -33,26 +31,26 @@ use crate::runner::CargoRunner;
 // ─────────────────────────── Shared state ────────────────────────────────────
 
 struct RunningEntry {
-    job:        RunningJob,
-    kill_tx:    tokio::sync::oneshot::Sender<()>,
+    job: RunningJob,
+    kill_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 struct SharedState {
-    running:     HashMap<String, RunningEntry>,   // job_id → entry
-    queue:       PriorityQueue,
-    active:      usize,
-    config:      GlobalConfig,
-    monitor:     ResourceMonitor,
+    running: HashMap<String, RunningEntry>, // job_id → entry
+    queue: PriorityQueue,
+    active: usize,
+    config: GlobalConfig,
+    monitor: ResourceMonitor,
 }
 
 impl SharedState {
     fn new(config: GlobalConfig) -> Self {
         Self {
-            running:  HashMap::new(),
-            queue:    PriorityQueue::new(),
-            active:   0,
+            running: HashMap::new(),
+            queue: PriorityQueue::new(),
+            active: 0,
             config,
-            monitor:  ResourceMonitor::new(),
+            monitor: ResourceMonitor::new(),
         }
     }
 
@@ -60,25 +58,31 @@ impl SharedState {
         let queued = self.queue.snapshot();
         StatusReport {
             running: self.running.values().map(|e| e.job.clone()).collect(),
-            queued:  queued.iter().enumerate().map(|(i, j)| QueuedJobSnapshot {
-                job_id:      j.job_id.clone(),
-                project_dir: j.project_dir.clone(),
-                alias:       j.alias.clone(),
-                args:        j.args.clone(),
-                priority:    j.priority,
-                queued_at:   j.queued_at,
-                position:    i,
-            }).collect(),
-            slots_total:  self.config.slots,
+            queued: queued
+                .iter()
+                .enumerate()
+                .map(|(i, j)| QueuedJobSnapshot {
+                    job_id: j.job_id.clone(),
+                    project_dir: j.project_dir.clone(),
+                    alias: j.alias.clone(),
+                    args: j.args.clone(),
+                    priority: j.priority,
+                    queued_at: j.queued_at,
+                    position: i,
+                })
+                .collect(),
+            slots_total: self.config.slots,
             slots_active: self.active,
-            cpu_pct:      self.monitor.cpu_usage(),
-            ram_pct:      self.monitor.ram_usage_pct(),
+            cpu_pct: self.monitor.cpu_usage(),
+            ram_pct: self.monitor.ram_usage_pct(),
         }
     }
 
     fn can_start_another(&mut self) -> bool {
-        self.active < self.config.slots
-            && self.monitor.can_start_build(self.config.max_cpu_pct, self.config.max_ram_pct)
+        (self.config.slots == 0 || self.active < self.config.slots)
+            && self
+                .monitor
+                .can_start_build(self.config.max_cpu_pct, self.config.max_ram_pct)
     }
 }
 
@@ -100,7 +104,11 @@ impl Daemon {
         ));
 
         // Spawn the job runner pool
-        tokio::spawn(runner_pool(Arc::clone(&state), Arc::clone(&notify), spawn_rx));
+        tokio::spawn(runner_pool(
+            Arc::clone(&state),
+            Arc::clone(&notify),
+            spawn_rx,
+        ));
 
         // Platform-specific listener
         #[cfg(unix)]
@@ -117,10 +125,7 @@ impl Daemon {
 // ─────────────────────────── Unix listener ────────────────────────────────────
 
 #[cfg(unix)]
-async fn run_unix_listener(
-    state:  Arc<Mutex<SharedState>>,
-    notify: Arc<Notify>,
-) -> Result<()> {
+async fn run_unix_listener(state: Arc<Mutex<SharedState>>, notify: Arc<Notify>) -> Result<()> {
     use tokio::net::UnixListener;
 
     let socket = socket_path();
@@ -136,13 +141,17 @@ async fn run_unix_listener(
     }
 
     let slots = state.lock().await.config.slots;
-    info!("Daemon listening on {} ({} slots)", socket.display(), slots);
+    info!(
+        "Daemon listening on {} ({} slots)",
+        socket.display(),
+        slot_limit_label(slots)
+    );
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let state   = Arc::clone(&state);
-                let notify  = Arc::clone(&notify);
+                let state = Arc::clone(&state);
+                let notify = Arc::clone(&notify);
                 tokio::spawn(async move {
                     let (reader, writer) = stream.into_split();
                     if let Err(e) = handle_connection(reader, writer, state, notify).await {
@@ -158,15 +167,16 @@ async fn run_unix_listener(
 // ─────────────────────────── Windows named pipe listener ──────────────────────
 
 #[cfg(windows)]
-async fn run_windows_listener(
-    state:  Arc<Mutex<SharedState>>,
-    notify: Arc<Notify>,
-) -> Result<()> {
+async fn run_windows_listener(state: Arc<Mutex<SharedState>>, notify: Arc<Notify>) -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let pipe_name = crate::ipc::pipe_name();
     let slots = state.lock().await.config.slots;
-    info!("Daemon listening on {} ({} slots)", pipe_name, slots);
+    info!(
+        "Daemon listening on {} ({} slots)",
+        pipe_name,
+        slot_limit_label(slots)
+    );
 
     // Create the first pipe instance
     let mut server = ServerOptions::new()
@@ -181,7 +191,7 @@ async fn run_windows_listener(
         let next_server = ServerOptions::new().create(&pipe_name)?;
         let current_server = std::mem::replace(&mut server, next_server);
 
-        let state  = Arc::clone(&state);
+        let state = Arc::clone(&state);
         let notify = Arc::clone(&notify);
 
         tokio::spawn(async move {
@@ -198,8 +208,8 @@ async fn run_windows_listener(
 // Picks the highest-priority queued job and sends it to the runner pool.
 
 async fn scheduler_loop(
-    state:    Arc<Mutex<SharedState>>,
-    notify:   Arc<Notify>,
+    state: Arc<Mutex<SharedState>>,
+    notify: Arc<Notify>,
     spawn_tx: mpsc::UnboundedSender<QueuedJob>,
 ) {
     loop {
@@ -211,8 +221,13 @@ async fn scheduler_loop(
         while s.can_start_another() {
             if let Some(job) = s.queue.pop_next() {
                 s.active += 1;
-                info!("Scheduling job {} (priority={:?}) — {}/{} slots",
-                    job.job_id, job.priority, s.active, s.config.slots);
+                info!(
+                    "Scheduling job {} (priority={:?}) — {}/{} slots",
+                    job.job_id,
+                    job.priority,
+                    s.active,
+                    slot_limit_label(s.config.slots),
+                );
                 let _ = spawn_tx.send(job);
             } else {
                 break;
@@ -226,38 +241,41 @@ async fn scheduler_loop(
 // When a job finishes, decrements active count and wakes the scheduler.
 
 async fn runner_pool(
-    state:    Arc<Mutex<SharedState>>,
-    notify:   Arc<Notify>,
-    mut rx:   mpsc::UnboundedReceiver<QueuedJob>,
+    state: Arc<Mutex<SharedState>>,
+    notify: Arc<Notify>,
+    mut rx: mpsc::UnboundedReceiver<QueuedJob>,
 ) {
     while let Some(queued_job) = rx.recv().await {
-        let state   = Arc::clone(&state);
-        let notify  = Arc::clone(&notify);
+        let state = Arc::clone(&state);
+        let notify = Arc::clone(&notify);
 
         tokio::spawn(async move {
-            let job_id      = queued_job.job_id.clone();
+            let job_id = queued_job.job_id.clone();
             let project_dir = queued_job.project_dir.clone();
-            let args        = queued_job.args.clone();
-            let child_jobs  = queued_job.child_jobs;
-            let alias       = queued_job.alias.clone();
+            let args = queued_job.args.clone();
+            let child_jobs = queued_job.child_jobs;
+            let alias = queued_job.alias.clone();
 
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
 
             // Register as running
             {
                 let mut s = state.lock().await;
-                s.running.insert(job_id.clone(), RunningEntry {
-                    job: RunningJob {
-                        job_id:      job_id.clone(),
-                        project_dir: project_dir.clone(),
-                        alias:       alias.clone(),
-                        args:        args.clone(),
-                        pid:         0,  // updated below
-                        started_at:  Utc::now(),
-                        elapsed_ms:  0,
+                s.running.insert(
+                    job_id.clone(),
+                    RunningEntry {
+                        job: RunningJob {
+                            job_id: job_id.clone(),
+                            project_dir: project_dir.clone(),
+                            alias: alias.clone(),
+                            args: args.clone(),
+                            pid: 0, // updated below
+                            started_at: Utc::now(),
+                            elapsed_ms: 0,
+                        },
+                        kill_tx,
                     },
-                    kill_tx,
-                });
+                );
             }
 
             let start = Instant::now();
@@ -283,7 +301,10 @@ async fn runner_pool(
                     };
 
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    info!("Job {} finished (exit={}, {}ms)", job_id, exit_code, duration_ms);
+                    info!(
+                        "Job {} finished (exit={}, {}ms)",
+                        job_id, exit_code, duration_ms
+                    );
                 }
                 Err(e) => {
                     error!("Failed to spawn job {}: {}", job_id, e);
@@ -308,7 +329,7 @@ async fn runner_pool(
 async fn handle_connection<R, W>(
     reader: R,
     mut writer: W,
-    state:  Arc<Mutex<SharedState>>,
+    state: Arc<Mutex<SharedState>>,
     notify: Arc<Notify>,
 ) -> Result<()>
 where
@@ -321,14 +342,25 @@ where
         let msg: ClientMsg = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                send(&mut writer, &DaemonMsg::Error { message: format!("Parse error: {}", e) }).await?;
+                send(
+                    &mut writer,
+                    &DaemonMsg::Error {
+                        message: format!("Parse error: {}", e),
+                    },
+                )
+                .await?;
                 continue;
             }
         };
 
         match msg {
             // ── Queue a build ─────────────────────────────────────────────────
-            ClientMsg::Run { job_id, project_dir, args, priority } => {
+            ClientMsg::Run {
+                job_id,
+                project_dir,
+                args,
+                priority,
+            } => {
                 let (resolved_priority, alias, child_jobs) = {
                     let s = state.lock().await;
                     let p = priority.unwrap_or_else(|| s.config.priority_for(&project_dir));
@@ -338,12 +370,12 @@ where
                 };
 
                 let job = QueuedJob {
-                    job_id:      job_id.clone(),
+                    job_id: job_id.clone(),
                     project_dir: project_dir.clone(),
                     alias,
-                    args:        args.clone(),
-                    priority:    resolved_priority,
-                    queued_at:   Utc::now(),
+                    args: args.clone(),
+                    priority: resolved_priority,
+                    queued_at: Utc::now(),
                     child_jobs,
                 };
 
@@ -358,21 +390,35 @@ where
             }
 
             // ── Reprioritize queued job ───────────────────────────────────────
-            ClientMsg::SetJobPriority { job_id, new_priority } => {
+            ClientMsg::SetJobPriority {
+                job_id,
+                new_priority,
+            } => {
                 let mut s = state.lock().await;
                 if s.queue.set_priority(&job_id, new_priority) {
                     let new_pos = s.queue.position_of(&job_id).unwrap_or(0);
                     drop(s);
                     notify.notify_one();
-                    send(&mut writer, &DaemonMsg::PriorityChanged {
-                        job_id,
-                        new_priority,
-                        new_position: new_pos,
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::PriorityChanged {
+                            job_id,
+                            new_priority,
+                            new_position: new_pos,
+                        },
+                    )
+                    .await?;
                 } else {
-                    send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Job '{}' not found in queue (may already be running)", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Error {
+                            message: format!(
+                                "Job '{}' not found in queue (may already be running)",
+                                job_id
+                            ),
+                        },
+                    )
+                    .await?;
                 }
             }
 
@@ -380,13 +426,24 @@ where
             ClientMsg::CancelJob { job_id } => {
                 let mut s = state.lock().await;
                 if s.queue.remove(&job_id).is_some() {
-                    send(&mut writer, &DaemonMsg::Killed {
-                        description: format!("Cancelled queued job {}", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Killed {
+                            description: format!("Cancelled queued job {}", job_id),
+                        },
+                    )
+                    .await?;
                 } else {
-                    send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Job '{}' not in queue (may be running — use kill-job instead)", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Error {
+                            message: format!(
+                                "Job '{}' not in queue (may be running — use kill-job instead)",
+                                job_id
+                            ),
+                        },
+                    )
+                    .await?;
                 }
             }
 
@@ -395,21 +452,33 @@ where
                 // First check the queue, then check running
                 let mut s = state.lock().await;
                 if s.queue.remove(&job_id).is_some() {
-                    send(&mut writer, &DaemonMsg::Killed {
-                        description: format!("Removed queued job {}", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Killed {
+                            description: format!("Removed queued job {}", job_id),
+                        },
+                    )
+                    .await?;
                 } else if let Some(entry) = s.running.remove(&job_id) {
                     let _ = entry.kill_tx.send(());
                     s.active = s.active.saturating_sub(1);
                     drop(s);
                     notify.notify_one();
-                    send(&mut writer, &DaemonMsg::Killed {
-                        description: format!("Killed running job {}", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Killed {
+                            description: format!("Killed running job {}", job_id),
+                        },
+                    )
+                    .await?;
                 } else {
-                    send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Job '{}' not found", job_id),
-                    }).await?;
+                    send(
+                        &mut writer,
+                        &DaemonMsg::Error {
+                            message: format!("Job '{}' not found", job_id),
+                        },
+                    )
+                    .await?;
                 }
             }
 
@@ -419,10 +488,10 @@ where
                 let removed_queued = s.queue.remove_project(&project_dir);
 
                 let mut killed_running = 0usize;
-                let running_ids: Vec<String> = s.running.keys()
-                    .filter(|id| {
-                        s.running[*id].job.project_dir == project_dir
-                    })
+                let running_ids: Vec<String> = s
+                    .running
+                    .keys()
+                    .filter(|id| s.running[*id].job.project_dir == project_dir)
                     .cloned()
                     .collect();
 
@@ -441,24 +510,49 @@ where
                     notify.notify_one();
                 }
 
-                send(&mut writer, &DaemonMsg::Killed {
-                    description: format!(
-                        "Killed {} job(s) for {} ({} running, {} queued)",
-                        total, project_dir, killed_running, removed_queued.len()
-                    ),
-                }).await?;
+                send(
+                    &mut writer,
+                    &DaemonMsg::Killed {
+                        description: format!(
+                            "Killed {} job(s) for {} ({} running, {} queued)",
+                            total,
+                            project_dir,
+                            killed_running,
+                            removed_queued.len()
+                        ),
+                    },
+                )
+                .await?;
             }
 
             // ── Config: set project priority ──────────────────────────────────
-            ClientMsg::SetProjectPriority { project_dir, priority } => {
+            ClientMsg::SetProjectPriority {
+                project_dir,
+                priority,
+            } => {
                 let mut s = state.lock().await;
                 match s.config.set_project_priority(&project_dir, priority) {
-                    Ok(_) => send(&mut writer, &DaemonMsg::ConfigUpdated {
-                        message: format!("Set default priority for '{}' to {:?}", project_dir, priority),
-                    }).await?,
-                    Err(e) => send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Config save failed: {}", e),
-                    }).await?,
+                    Ok(_) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::ConfigUpdated {
+                                message: format!(
+                                    "Set default priority for '{}' to {:?}",
+                                    project_dir, priority
+                                ),
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Error {
+                                message: format!("Config save failed: {}", e),
+                            },
+                        )
+                        .await?
+                    }
                 }
             }
 
@@ -466,25 +560,55 @@ where
             ClientMsg::SetProjectAlias { project_dir, alias } => {
                 let mut s = state.lock().await;
                 match s.config.set_project_alias(&project_dir, &alias) {
-                    Ok(_) => send(&mut writer, &DaemonMsg::ConfigUpdated {
-                        message: format!("Alias for '{}' set to '{}'", project_dir, alias),
-                    }).await?,
-                    Err(e) => send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Config save failed: {}", e),
-                    }).await?,
+                    Ok(_) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::ConfigUpdated {
+                                message: format!("Alias for '{}' set to '{}'", project_dir, alias),
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Error {
+                                message: format!("Config save failed: {}", e),
+                            },
+                        )
+                        .await?
+                    }
                 }
             }
 
             // ── Config: set project child_jobs ────────────────────────────────
-            ClientMsg::SetProjectChildJobs { project_dir, child_jobs } => {
+            ClientMsg::SetProjectChildJobs {
+                project_dir,
+                child_jobs,
+            } => {
                 let mut s = state.lock().await;
                 match s.config.set_project_child_jobs(&project_dir, child_jobs) {
-                    Ok(_) => send(&mut writer, &DaemonMsg::ConfigUpdated {
-                        message: format!("child_jobs for '{}' set to {}", project_dir, child_jobs),
-                    }).await?,
-                    Err(e) => send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Config save failed: {}", e),
-                    }).await?,
+                    Ok(_) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::ConfigUpdated {
+                                message: format!(
+                                    "child_jobs for '{}' set to {}",
+                                    project_dir, child_jobs
+                                ),
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Error {
+                                message: format!("Config save failed: {}", e),
+                            },
+                        )
+                        .await?
+                    }
                 }
             }
 
@@ -493,16 +617,29 @@ where
                 let mut s = state.lock().await;
                 match s.config.set_slots(slots) {
                     Ok(_) => {
-                        s.config.slots = slots;
+                        let effective_slots = s.config.slots;
                         drop(s);
                         notify.notify_one();
-                        send(&mut writer, &DaemonMsg::ConfigUpdated {
-                            message: format!("Slots set to {} (effective immediately)", slots),
-                        }).await?
+                        send(
+                            &mut writer,
+                            &DaemonMsg::ConfigUpdated {
+                                message: format!(
+                                    "Slots set to {} (effective immediately)",
+                                    slot_limit_label(effective_slots),
+                                ),
+                            },
+                        )
+                        .await?
                     }
-                    Err(e) => send(&mut writer, &DaemonMsg::Error {
-                        message: format!("Config save failed: {}", e),
-                    }).await?,
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Error {
+                                message: format!("Config save failed: {}", e),
+                            },
+                        )
+                        .await?
+                    }
                 }
             }
 
@@ -538,13 +675,41 @@ where
 
 // ─────────────────────────── Helper ──────────────────────────────────────────
 
-async fn send<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    msg:    &DaemonMsg,
-) -> Result<()> {
+async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, msg: &DaemonMsg) -> Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_slots_means_unlimited_daemon_scheduling_slots() {
+        let mut config = GlobalConfig::default();
+        config.slots = 0;
+        config.max_cpu_pct = 100.0;
+        config.max_ram_pct = 100.0;
+
+        let mut state = SharedState::new(config);
+        state.active = 512;
+
+        assert!(state.can_start_another());
+    }
+
+    #[test]
+    fn positive_slots_still_cap_daemon_scheduling() {
+        let mut config = GlobalConfig::default();
+        config.slots = 4;
+        config.max_cpu_pct = 100.0;
+        config.max_ram_pct = 100.0;
+
+        let mut state = SharedState::new(config);
+        state.active = 4;
+
+        assert!(!state.can_start_another());
+    }
 }

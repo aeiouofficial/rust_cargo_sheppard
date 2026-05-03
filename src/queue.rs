@@ -6,20 +6,20 @@
 //   - O(n) reprioritization (find by job_id, remove, reinsert at new priority)
 //   - FIFO ordering within the same priority level (earlier enqueue time wins)
 
-use chrono::{DateTime, Utc};
 use crate::config::Priority;
+use chrono::{DateTime, Utc};
 
 // ─────────────────────────── Job record ──────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct QueuedJob {
-    pub job_id:      String,
+    pub job_id: String,
     pub project_dir: String,
-    pub alias:       String,        // display name, pre-resolved from config
-    pub args:        Vec<String>,
-    pub priority:    Priority,
-    pub queued_at:   DateTime<Utc>,
-    pub child_jobs:  usize,         // CARGO_BUILD_JOBS for this specific invocation
+    pub alias: String, // display name, pre-resolved from config
+    pub args: Vec<String>,
+    pub priority: Priority,
+    pub queued_at: DateTime<Utc>,
+    pub child_jobs: usize, // CARGO_BUILD_JOBS for this specific invocation
 }
 
 // ─────────────────────────── PriorityQueue ───────────────────────────────────
@@ -43,8 +43,7 @@ impl PriorityQueue {
             // - existing has strictly higher priority, OR
             // - same priority AND existing was enqueued earlier
             existing.priority > job.priority
-                || (existing.priority == job.priority
-                    && existing.queued_at <= job.queued_at)
+                || (existing.priority == job.priority && existing.queued_at <= job.queued_at)
         });
         self.inner.insert(pos, job);
     }
@@ -56,11 +55,6 @@ impl PriorityQueue {
         } else {
             Some(self.inner.remove(0))
         }
-    }
-
-    /// Peek at the next job without removing it.
-    pub fn peek_next(&self) -> Option<&QueuedJob> {
-        self.inner.first()
     }
 
     /// Change the priority of a queued job and re-sort.
@@ -95,12 +89,9 @@ impl PriorityQueue {
         removed
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 
     /// Snapshot of all queued jobs in order (for status reporting).
@@ -122,22 +113,22 @@ mod tests {
 
     fn make_job(id: &str, priority: Priority, offset_ms: i64) -> QueuedJob {
         QueuedJob {
-            job_id:      id.to_string(),
+            job_id: id.to_string(),
             project_dir: "/tmp/test".to_string(),
-            alias:       "test".to_string(),
-            args:        vec!["check".to_string()],
+            alias: "test".to_string(),
+            args: vec!["check".to_string()],
             priority,
-            queued_at:   Utc::now() + chrono::Duration::milliseconds(offset_ms),
-            child_jobs:  2,
+            queued_at: Utc::now() + chrono::Duration::milliseconds(offset_ms),
+            child_jobs: 2,
         }
     }
 
     #[test]
     fn test_priority_ordering() {
         let mut q = PriorityQueue::new();
-        q.push(make_job("low",  Priority::Low,      0));
-        q.push(make_job("high", Priority::High,     100));
-        q.push(make_job("norm", Priority::Normal,   50));
+        q.push(make_job("low", Priority::Low, 0));
+        q.push(make_job("high", Priority::High, 100));
+        q.push(make_job("norm", Priority::Normal, 50));
         q.push(make_job("crit", Priority::Critical, 200));
 
         assert_eq!(q.pop_next().unwrap().job_id, "crit");
@@ -149,9 +140,9 @@ mod tests {
     #[test]
     fn test_fifo_within_same_priority() {
         let mut q = PriorityQueue::new();
-        q.push(make_job("first",  Priority::Normal, 0));
+        q.push(make_job("first", Priority::Normal, 0));
         q.push(make_job("second", Priority::Normal, 10));
-        q.push(make_job("third",  Priority::Normal, 20));
+        q.push(make_job("third", Priority::Normal, 20));
 
         assert_eq!(q.pop_next().unwrap().job_id, "first");
         assert_eq!(q.pop_next().unwrap().job_id, "second");
@@ -162,7 +153,7 @@ mod tests {
     fn test_reprioritize() {
         let mut q = PriorityQueue::new();
         q.push(make_job("a", Priority::Normal, 0));
-        q.push(make_job("b", Priority::Low,    10));
+        q.push(make_job("b", Priority::Low, 10));
 
         // b is low priority, let's bump it to critical
         assert!(q.set_priority("b", Priority::Critical));

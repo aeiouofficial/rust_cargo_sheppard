@@ -4,8 +4,8 @@
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 pub struct ResourceMonitor {
-    sys:          System,
-    last_cpu:     f32,
+    sys: System,
+    last_cpu: f32,
     last_ram_pct: f64,
 }
 
@@ -16,12 +16,16 @@ impl ResourceMonitor {
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything()),
         );
-        Self { sys, last_cpu: 0.0, last_ram_pct: 0.0 }
+        Self {
+            sys,
+            last_cpu: 0.0,
+            last_ram_pct: 0.0,
+        }
     }
 
     /// Refresh the internal counters. Call before reading CPU/RAM.
     pub fn refresh(&mut self) {
-        self.sys.refresh_cpu_all();
+        self.sys.refresh_all();
         self.sys.refresh_memory();
 
         let cpus = self.sys.cpus();
@@ -39,8 +43,12 @@ impl ResourceMonitor {
         };
     }
 
-    pub fn cpu_usage(&self)     -> f32  { self.last_cpu }
-    pub fn ram_usage_pct(&self) -> f64  { self.last_ram_pct }
+    pub fn cpu_usage(&self) -> f32 {
+        self.last_cpu
+    }
+    pub fn ram_usage_pct(&self) -> f64 {
+        self.last_ram_pct
+    }
 
     /// Returns true when it's safe to start another build.
     /// Thresholds are supplied by the caller (from config) so they can be
@@ -48,12 +56,10 @@ impl ResourceMonitor {
     pub fn can_start_build(&self, max_cpu: f32, max_ram: f64) -> bool {
         self.last_cpu < max_cpu && self.last_ram_pct < max_ram
     }
-
-    pub fn summary(&self) -> String {
-        format!("CPU {:.1}%  RAM {:.1}%", self.last_cpu, self.last_ram_pct)
-    }
 }
 
 impl Default for ResourceMonitor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

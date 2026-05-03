@@ -19,15 +19,13 @@ impl ShepherdClient {
         {
             use tokio::net::UnixStream;
             let path = crate::ipc::socket_path();
-            let stream = UnixStream::connect(&path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Cannot connect to shepherd daemon at {}\n\
+            let stream = UnixStream::connect(&path).await.with_context(|| {
+                format!(
+                    "Cannot connect to shepherd daemon at {}\n\
                          Is it running? Start with: shepherd daemon",
-                        path.display()
-                    )
-                })?;
+                    path.display()
+                )
+            })?;
             let (reader, writer) = stream.into_split();
             Ok(Self {
                 reader: BufReader::new(Box::new(reader)),
@@ -36,8 +34,8 @@ impl ShepherdClient {
         }
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ClientOptions;
             use std::io;
+            use tokio::net::windows::named_pipe::ClientOptions;
 
             let pipe_name = crate::ipc::pipe_name();
 
@@ -80,16 +78,6 @@ impl ShepherdClient {
         let mut resp_line = String::new();
         self.reader.read_line(&mut resp_line).await?;
 
-        serde_json::from_str(resp_line.trim())
-            .context("Failed to parse daemon response as JSON")
-    }
-
-    /// Convenience: fire-and-forget (ignores response).
-    pub async fn send(&mut self, msg: &ClientMsg) -> Result<()> {
-        let mut line = serde_json::to_string(msg)?;
-        line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await?;
-        Ok(())
+        serde_json::from_str(resp_line.trim()).context("Failed to parse daemon response as JSON")
     }
 }

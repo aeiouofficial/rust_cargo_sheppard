@@ -16,10 +16,10 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     Background = 0, // only runs when all slots would otherwise be empty
-    Low        = 1,
-    Normal     = 2, // default
-    High       = 3,
-    Critical   = 4, // jumps every other job — use for cargo run
+    Low = 1,
+    Normal = 2, // default
+    High = 3,
+    Critical = 4, // jumps every other job — use for cargo run
 }
 
 impl Priority {
@@ -40,10 +40,10 @@ impl Priority {
     pub fn label(self) -> &'static str {
         match self {
             Priority::Background => "BG",
-            Priority::Low        => "LOW",
-            Priority::Normal     => "NORM",
-            Priority::High       => "HIGH",
-            Priority::Critical   => "CRIT",
+            Priority::Low => "LOW",
+            Priority::Normal => "NORM",
+            Priority::High => "HIGH",
+            Priority::Critical => "CRIT",
         }
     }
 
@@ -57,7 +57,9 @@ impl Priority {
 }
 
 impl Default for Priority {
-    fn default() -> Self { Priority::Normal }
+    fn default() -> Self {
+        Priority::Normal
+    }
 }
 
 impl std::fmt::Display for Priority {
@@ -102,7 +104,7 @@ impl ProjectConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     /// How many cargo builds can run simultaneously.
-    /// Default: max(1, cpu_count / 2)
+    /// 0 means unlimited job-level concurrency; resource gates still apply.
     pub slots: usize,
 
     /// Halt scheduling new jobs if CPU exceeds this percentage.
@@ -128,15 +130,14 @@ pub struct GlobalConfig {
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        let cpu = num_cpus();
         Self {
-            slots:          (cpu / 2).max(1),
-            max_cpu_pct:    80.0,
-            max_ram_pct:    85.0,
-            child_jobs:     2,
-            log_level:      "info".into(),
-            ui_refresh_ms:  500,
-            projects:       Vec::new(),
+            slots: 0,
+            max_cpu_pct: 80.0,
+            max_ram_pct: 85.0,
+            child_jobs: 2,
+            log_level: "info".into(),
+            ui_refresh_ms: 500,
+            projects: Vec::new(),
         }
     }
 }
@@ -146,8 +147,7 @@ impl GlobalConfig {
 
     /// Platform-correct path to the config file.
     pub fn config_path() -> Result<PathBuf> {
-        let base = dirs::config_dir()
-            .context("Cannot determine config directory for this OS")?;
+        let base = dirs::config_dir().context("Cannot determine config directory for this OS")?;
         Ok(base.join("shepherd").join("config.toml"))
     }
 
@@ -179,8 +179,8 @@ impl GlobalConfig {
                 .with_context(|| format!("Cannot create config dir: {}", parent.display()))?;
         }
 
-        let toml_str = toml::to_string_pretty(self)
-            .context("Failed to serialize config to TOML")?;
+        let toml_str =
+            toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
 
         std::fs::write(&path, toml_str)
             .with_context(|| format!("Cannot write config: {}", path.display()))?;
@@ -233,8 +233,8 @@ impl GlobalConfig {
 
     /// Set the default priority for a project, creating a ProjectConfig entry if needed.
     pub fn set_project_priority(&mut self, project_dir: &str, priority: Priority) -> Result<()> {
-        let canonical = std::fs::canonicalize(project_dir)
-            .unwrap_or_else(|_| PathBuf::from(project_dir));
+        let canonical =
+            std::fs::canonicalize(project_dir).unwrap_or_else(|_| PathBuf::from(project_dir));
         let path_str = canonical.to_string_lossy().to_string();
 
         if let Some(p) = self.projects.iter_mut().find(|p| p.path == path_str) {
@@ -253,8 +253,8 @@ impl GlobalConfig {
 
     /// Set an alias for a project directory.
     pub fn set_project_alias(&mut self, project_dir: &str, alias: &str) -> Result<()> {
-        let canonical = std::fs::canonicalize(project_dir)
-            .unwrap_or_else(|_| PathBuf::from(project_dir));
+        let canonical =
+            std::fs::canonicalize(project_dir).unwrap_or_else(|_| PathBuf::from(project_dir));
         let path_str = canonical.to_string_lossy().to_string();
 
         if let Some(p) = self.projects.iter_mut().find(|p| p.path == path_str) {
@@ -272,14 +272,14 @@ impl GlobalConfig {
     }
 
     pub fn set_slots(&mut self, slots: usize) -> Result<()> {
-        self.slots = slots.max(1);
+        self.slots = normalize_slots(slots);
         self.save()
     }
 
     /// Set the per-project child_jobs (CARGO_BUILD_JOBS), creating a ProjectConfig entry if needed.
     pub fn set_project_child_jobs(&mut self, project_dir: &str, child_jobs: usize) -> Result<()> {
-        let canonical = std::fs::canonicalize(project_dir)
-            .unwrap_or_else(|_| PathBuf::from(project_dir));
+        let canonical =
+            std::fs::canonicalize(project_dir).unwrap_or_else(|_| PathBuf::from(project_dir));
         let path_str = canonical.to_string_lossy().to_string();
 
         if let Some(p) = self.projects.iter_mut().find(|p| p.path == path_str) {
@@ -299,13 +299,31 @@ impl GlobalConfig {
 
 // ─────────────────────────── Helpers ─────────────────────────────────────────
 
-/// Returns the number of available CPUs (public for CLI default display).
-pub fn available_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+pub fn normalize_slots(slots: usize) -> usize {
+    slots
 }
 
-fn num_cpus() -> usize {
-    available_cpus()
+pub fn slot_limit_label(slots: usize) -> String {
+    if slots == 0 {
+        "unlimited".to_string()
+    } else {
+        slots.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_slots_are_unlimited() {
+        assert_eq!(GlobalConfig::default().slots, 0);
+    }
+
+    #[test]
+    fn normalize_slots_keeps_zero_as_unlimited() {
+        assert_eq!(normalize_slots(0), 0);
+        assert_eq!(normalize_slots(1), 1);
+        assert_eq!(normalize_slots(8), 8);
+    }
 }

@@ -17,7 +17,7 @@ use colored::Colorize;
 use uuid::Uuid;
 
 use crate::client::ShepherdClient;
-use crate::config::{GlobalConfig, Priority};
+use crate::config::{slot_limit_label, GlobalConfig, Priority};
 use crate::ipc::{ClientMsg, DaemonMsg};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -36,9 +36,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start the shepherd daemon (keep this running in a dedicated terminal)
+    /// Start the shepherd daemon (0 slots = unlimited; resource gates still apply)
     Daemon {
-        /// Max concurrent builds (default: cpu_count / 2, min 1)
+        /// Max concurrent builds (0 = unlimited; default comes from config)
         #[arg(short, long)]
         slots: Option<usize>,
     },
@@ -76,9 +76,7 @@ enum Cmd {
     },
 
     /// Cancel a queued job (before it starts). Use 'kill --job' for running jobs.
-    Cancel {
-        job_id: String,
-    },
+    Cancel { job_id: String },
 
     /// Change priority of a queued job live
     Reprioritize {
@@ -104,7 +102,7 @@ enum ConfigCmd {
     /// Show current config as TOML
     Show,
 
-    /// Set global concurrent build slot count
+    /// Set global concurrent build slot count (0 = unlimited)
     Slots { count: usize },
 
     /// Set the default priority for a project directory
@@ -144,7 +142,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Daemon { slots } => cmd_daemon(slots).await,
-        Cmd::Run { args, dir, priority } => cmd_run(args, dir, priority).await,
+        Cmd::Run {
+            args,
+            dir,
+            priority,
+        } => cmd_run(args, dir, priority).await,
         Cmd::Status => cmd_status().await,
         Cmd::Tui => cmd_tui().await,
         Cmd::Kill { project, job } => cmd_kill(project, job).await,
@@ -167,14 +169,16 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(config.log_level.parse().unwrap_or_else(|_| "info".parse().unwrap())),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                config
+                    .log_level
+                    .parse()
+                    .unwrap_or_else(|_| "info".parse().unwrap()),
+            ),
         )
         .init();
 
-    let effective_slots = slots
-        .unwrap_or(config.slots)
-        .max(1);
+    let effective_slots = slots.unwrap_or(config.slots);
 
     let mut live_config = config;
     live_config.slots = effective_slots;
@@ -182,7 +186,7 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
     println!(
         "{} {} build slot(s)  |  config: {}",
         "🐑 cargo-shepherd daemon starting —".cyan().bold(),
-        effective_slots.to_string().yellow().bold(),
+        slot_limit_label(effective_slots).yellow().bold(),
         GlobalConfig::config_path()?.display().to_string().dimmed(),
     );
 
@@ -190,17 +194,17 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
 }
 
 async fn cmd_run(args: Vec<String>, dir: Option<String>, priority_str: String) -> Result<()> {
-    let priority   = parse_priority(&priority_str)?;
+    let priority = parse_priority(&priority_str)?;
     let project_dir = resolve_dir(dir)?;
-    let job_id     = Uuid::new_v4().to_string();
+    let job_id = Uuid::new_v4().to_string();
 
     let mut client = ShepherdClient::connect().await?;
 
     let msg = ClientMsg::Run {
-        job_id:      job_id.clone(),
+        job_id: job_id.clone(),
         project_dir: project_dir.clone(),
-        args:        args.clone(),
-        priority:    Some(priority),
+        args: args.clone(),
+        priority: Some(priority),
     };
 
     match client.send_recv(&msg).await? {
@@ -232,7 +236,7 @@ async fn cmd_status() -> Result<()> {
                 "\n{}  slots {}/{}  CPU {:.1}%  RAM {:.1}%",
                 "═══ cargo-shepherd ═══".cyan().bold(),
                 report.slots_active,
-                report.slots_total,
+                slot_limit_label(report.slots_total),
                 report.cpu_pct,
                 report.ram_pct,
             );
@@ -261,10 +265,10 @@ async fn cmd_status() -> Result<()> {
                 println!("\n{}", "  ○ QUEUED".yellow().bold());
                 for job in &report.queued {
                     let prio_colored = match job.priority {
-                        Priority::Critical   => job.priority.label().red().bold().to_string(),
-                        Priority::High       => job.priority.label().yellow().bold().to_string(),
-                        Priority::Normal     => job.priority.label().normal().to_string(),
-                        Priority::Low        => job.priority.label().dimmed().to_string(),
+                        Priority::Critical => job.priority.label().red().bold().to_string(),
+                        Priority::High => job.priority.label().yellow().bold().to_string(),
+                        Priority::Normal => job.priority.label().normal().to_string(),
+                        Priority::Low => job.priority.label().dimmed().to_string(),
                         Priority::Background => job.priority.label().dimmed().to_string(),
                     };
                     println!(
@@ -294,7 +298,11 @@ async fn cmd_tui() -> Result<()> {
 
 async fn cmd_kill(project: Option<String>, job: Option<String>) -> Result<()> {
     let msg = if let Some(proj) = project {
-        let dir = if proj == "." { resolve_dir(None)? } else { proj };
+        let dir = if proj == "." {
+            resolve_dir(None)?
+        } else {
+            proj
+        };
         ClientMsg::KillProject { project_dir: dir }
     } else if let Some(id) = job {
         ClientMsg::KillJob { job_id: id }
@@ -306,7 +314,7 @@ async fn cmd_kill(project: Option<String>, job: Option<String>) -> Result<()> {
     let mut client = ShepherdClient::connect().await?;
     match client.send_recv(&msg).await? {
         DaemonMsg::Killed { description } => println!("{} {}", "✔".green(), description),
-        DaemonMsg::Error  { message }     => eprintln!("{} {}", "✗".red(), message),
+        DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
         other => eprintln!("Unexpected: {:?}", other),
     }
 
@@ -317,7 +325,7 @@ async fn cmd_cancel(job_id: String) -> Result<()> {
     let mut client = ShepherdClient::connect().await?;
     match client.send_recv(&ClientMsg::CancelJob { job_id }).await? {
         DaemonMsg::Killed { description } => println!("{} {}", "✔".green(), description),
-        DaemonMsg::Error  { message }     => eprintln!("{} {}", "✗".red(), message),
+        DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
         other => eprintln!("Unexpected: {:?}", other),
     }
     Ok(())
@@ -325,10 +333,20 @@ async fn cmd_cancel(job_id: String) -> Result<()> {
 
 async fn cmd_reprioritize(job_id: String, priority_str: String) -> Result<()> {
     let new_priority = parse_priority(&priority_str)?;
-    let mut client   = ShepherdClient::connect().await?;
+    let mut client = ShepherdClient::connect().await?;
 
-    match client.send_recv(&ClientMsg::SetJobPriority { job_id, new_priority }).await? {
-        DaemonMsg::PriorityChanged { new_priority, new_position, .. } => {
+    match client
+        .send_recv(&ClientMsg::SetJobPriority {
+            job_id,
+            new_priority,
+        })
+        .await?
+    {
+        DaemonMsg::PriorityChanged {
+            new_priority,
+            new_position,
+            ..
+        } => {
             println!(
                 "{} Priority → {}  (position {})",
                 "✔".green(),
@@ -359,7 +377,10 @@ async fn cmd_config(sub: ConfigCmd) -> Result<()> {
 
         ConfigCmd::Slots { count } => {
             let mut client = ShepherdClient::connect().await?;
-            match client.send_recv(&ClientMsg::SetSlots { slots: count }).await? {
+            match client
+                .send_recv(&ClientMsg::SetSlots { slots: count })
+                .await?
+            {
                 DaemonMsg::ConfigUpdated { message } => println!("{} {}", "✔".green(), message),
                 DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
                 _ => {}
@@ -368,9 +389,15 @@ async fn cmd_config(sub: ConfigCmd) -> Result<()> {
 
         ConfigCmd::Priority { dir, priority } => {
             let project_dir = resolve_dir(dir)?;
-            let p           = parse_priority(&priority)?;
-            let mut client  = ShepherdClient::connect().await?;
-            match client.send_recv(&ClientMsg::SetProjectPriority { project_dir, priority: p }).await? {
+            let p = parse_priority(&priority)?;
+            let mut client = ShepherdClient::connect().await?;
+            match client
+                .send_recv(&ClientMsg::SetProjectPriority {
+                    project_dir,
+                    priority: p,
+                })
+                .await?
+            {
                 DaemonMsg::ConfigUpdated { message } => println!("{} {}", "✔".green(), message),
                 DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
                 _ => {}
@@ -379,8 +406,11 @@ async fn cmd_config(sub: ConfigCmd) -> Result<()> {
 
         ConfigCmd::Alias { dir, alias } => {
             let project_dir = resolve_dir(dir)?;
-            let mut client  = ShepherdClient::connect().await?;
-            match client.send_recv(&ClientMsg::SetProjectAlias { project_dir, alias }).await? {
+            let mut client = ShepherdClient::connect().await?;
+            match client
+                .send_recv(&ClientMsg::SetProjectAlias { project_dir, alias })
+                .await?
+            {
                 DaemonMsg::ConfigUpdated { message } => println!("{} {}", "✔".green(), message),
                 DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
                 _ => {}
@@ -389,8 +419,14 @@ async fn cmd_config(sub: ConfigCmd) -> Result<()> {
 
         ConfigCmd::ChildJobs { dir, jobs } => {
             let project_dir = resolve_dir(dir)?;
-            let mut client  = ShepherdClient::connect().await?;
-            match client.send_recv(&ClientMsg::SetProjectChildJobs { project_dir, child_jobs: jobs }).await? {
+            let mut client = ShepherdClient::connect().await?;
+            match client
+                .send_recv(&ClientMsg::SetProjectChildJobs {
+                    project_dir,
+                    child_jobs: jobs,
+                })
+                .await?
+            {
                 DaemonMsg::ConfigUpdated { message } => println!("{} {}", "✔".green(), message),
                 DaemonMsg::Error { message } => eprintln!("{} {}", "✗".red(), message),
                 _ => {}
@@ -413,7 +449,7 @@ async fn cmd_stop() -> Result<()> {
 fn resolve_dir(dir: Option<String>) -> Result<String> {
     let path = match dir {
         Some(d) => std::path::PathBuf::from(d),
-        None    => std::env::current_dir()?,
+        None => std::env::current_dir()?,
     };
     Ok(path.to_string_lossy().to_string())
 }
@@ -421,9 +457,9 @@ fn resolve_dir(dir: Option<String>) -> Result<String> {
 fn parse_priority(s: &str) -> Result<Priority> {
     match s.to_lowercase().as_str() {
         "background" | "bg" | "0" => Ok(Priority::Background),
-        "low"  | "l" | "1"        => Ok(Priority::Low),
-        "normal" | "n" | "2"      => Ok(Priority::Normal),
-        "high" | "h" | "3"        => Ok(Priority::High),
+        "low" | "l" | "1" => Ok(Priority::Low),
+        "normal" | "n" | "2" => Ok(Priority::Normal),
+        "high" | "h" | "3" => Ok(Priority::High),
         "critical" | "crit" | "c" | "4" => Ok(Priority::Critical),
         other => anyhow::bail!(
             "Unknown priority '{}'. Valid values: background, low, normal, high, critical",

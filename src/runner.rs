@@ -10,20 +10,20 @@ use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
 pub struct CargoRunner {
-    pub pid:   u32,
-    child:     Child,
+    pub pid: u32,
+    child: Child,
 }
 
 impl CargoRunner {
     /// Spawn `cargo <args>` in `project_dir` with a capped rustc thread count.
     pub async fn spawn(
         project_dir: &str,
-        args:        &[String],
-        job_id:      &str,
-        child_jobs:  usize,
+        args: &[String],
+        job_id: &str,
+        child_jobs: usize,
     ) -> Result<Self> {
-        let dir    = PathBuf::from(project_dir);
-        let id     = job_id.to_string();
+        let dir = PathBuf::from(project_dir);
+        let id = job_id.to_string();
         let cj_str = child_jobs.to_string();
 
         let mut cmd = Command::new("cargo");
@@ -37,9 +37,13 @@ impl CargoRunner {
             .env("CARGO_BUILD_JOBS", &cj_str)
             .env("CARGO_TERM_COLOR", "always");
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn `cargo {}` in {}", args.join(" "), project_dir))?;
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn `cargo {}` in {}",
+                args.join(" "),
+                project_dir
+            )
+        })?;
 
         let pid = child.id().unwrap_or(0);
 
@@ -83,7 +87,10 @@ impl CargoRunner {
     /// Send SIGKILL / TerminateProcess. Safe to call multiple times.
     pub async fn kill(&mut self) {
         if let Err(e) = self.child.kill().await {
-            warn!("Failed to kill child process (may have already exited): {}", e);
+            warn!(
+                "Failed to kill child process (may have already exited): {}",
+                e
+            );
         }
     }
 }

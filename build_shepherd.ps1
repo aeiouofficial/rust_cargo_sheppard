@@ -2,7 +2,11 @@
 # 🐑 cargo-shepherd Build Script
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$rootDir = Split-Path -Parent $scriptDir
+$rootDir = if (Test-Path (Join-Path $scriptDir "Cargo.toml")) {
+    $scriptDir
+} else {
+    Split-Path -Parent $scriptDir
+}
 
 Push-Location $rootDir
 
