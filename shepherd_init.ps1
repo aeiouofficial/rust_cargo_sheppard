@@ -36,7 +36,11 @@ elseif ($hasSource -and $hasCargo) {
     if ($choice -eq "Y" -or $choice -eq "y") {
         Write-Host "Compiling... (this may take a minute)" -ForegroundColor Gray
         
-        $maxRetries = 3
+        # NUCLEAR OPTION: Randomized target dir to bypass persistent locks
+        $randomId = Get-Random -Minimum 1000 -Maximum 9999
+        $env:CARGO_TARGET_DIR = "target_tmp_$randomId"
+
+        $maxRetries = 2
         $retryCount = 0
         $success = $false
 
@@ -47,20 +51,22 @@ elseif ($hasSource -and $hasCargo) {
             } else {
                 $retryCount++
                 if ($retryCount -lt $maxRetries) {
-                    Write-Host "⚠ Build blocked. Retrying in 3s... ($retryCount/$maxRetries)" -ForegroundColor Yellow
+                    Write-Host "⚠ Build blocked. Retrying in 2s..." -ForegroundColor Yellow
                     taskkill /F /IM shepherd.exe /T 2>$null
-                    Start-Sleep -Seconds 3
+                    Start-Sleep -Seconds 2
                 }
             }
         }
 
         if ($success) {
             Write-Host "✔ Build successful." -ForegroundColor Green
-            Start-Process powershell -ArgumentList "-NoExit", "-Command", "cargo run --release -- daemon"
+            # Copy to current dir for easy access
+            Copy-Item "$env:CARGO_TARGET_DIR\release\shepherd.exe" ".\shepherd.exe" -Force
+            Start-Process powershell -ArgumentList "-NoExit", "-Command", ".\shepherd.exe daemon"
             Start-Sleep -Seconds 1
-            cargo run --release -- tui
+            .\shepherd.exe tui
         } else {
-            Write-Host "✗ Build failed after $maxRetries attempts. Please close your IDE or Antivirus." -ForegroundColor Red
+            Write-Host "✗ Build failed. Please close your IDE or Antivirus." -ForegroundColor Red
         }
     }
 }
