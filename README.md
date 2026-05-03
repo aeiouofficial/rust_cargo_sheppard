@@ -103,6 +103,7 @@ Workflow for sheps:
 First time: double-click bin/build_shepherd.bat
 
 when download + build finished = .exe gets created (you dont start the app with it)
+--> start start_shepherd.bat to launch the tui.
 ```
 
 ---
