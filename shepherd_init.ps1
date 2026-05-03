@@ -13,9 +13,11 @@ Write-Host "Location: $scriptDir`n" -ForegroundColor Gray
 # 1. Check for binary
 $exePath = Join-Path $scriptDir "shepherd.exe"
 if (!(Test-Path $exePath)) {
-    # Check in target/debug or target/release if they exist
-    if (Test-Path "target\release\shepherd.exe") { $exePath = "target\release\shepherd.exe" }
-    elseif (Test-Path "target\debug\shepherd.exe") { $exePath = "target\debug\shepherd.exe" }
+    if (Test-Path "target\release\shepherd.exe") {
+        $exePath = Join-Path $scriptDir "target\release\shepherd.exe"
+    } elseif (Test-Path "target\debug\shepherd.exe") {
+        $exePath = Join-Path $scriptDir "target\debug\shepherd.exe"
+    }
 }
 
 # 2. Check for Cargo (source build)
@@ -25,7 +27,10 @@ $hasSource = Test-Path "Cargo.toml"
 if (Test-Path $exePath) {
     Write-Host "✔ Found executable: $exePath" -ForegroundColor Green
     Write-Host "Starting Daemon..." -ForegroundColor Gray
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '$exePath' daemon"
+    
+    # Start daemon in new window
+    Start-Process powershell -ArgumentList "-NoExit", "-Command", "& `"$exePath`" daemon"
+    
     Start-Sleep -Seconds 1
     Write-Host "Launching TUI..." -ForegroundColor Yellow
     & $exePath tui
@@ -36,7 +41,6 @@ elseif ($hasSource -and $hasCargo) {
     if ($choice -eq "Y" -or $choice -eq "y") {
         Write-Host "Compiling... (this may take a minute)" -ForegroundColor Gray
         
-        # NUCLEAR OPTION: Randomized target dir to bypass persistent locks
         $randomId = Get-Random -Minimum 1000 -Maximum 9999
         $env:CARGO_TARGET_DIR = "target_tmp_$randomId"
 
@@ -60,8 +64,8 @@ elseif ($hasSource -and $hasCargo) {
 
         if ($success) {
             Write-Host "✔ Build successful." -ForegroundColor Green
-            # Copy to current dir for easy access
-            Copy-Item "$env:CARGO_TARGET_DIR\release\shepherd.exe" ".\shepherd.exe" -Force
+            $relExe = Join-Path $scriptDir "$env:CARGO_TARGET_DIR\release\shepherd.exe"
+            Copy-Item $relExe ".\shepherd.exe" -Force
             Start-Process powershell -ArgumentList "-NoExit", "-Command", ".\shepherd.exe daemon"
             Start-Sleep -Seconds 1
             .\shepherd.exe tui

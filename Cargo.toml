@@ -35,5 +35,5 @@ ratatui      = "0.29"
 crossterm    = { version = "0.28", features = ["event-stream"] }
 futures      = "0.3"        # StreamExt for crossterm EventStream in TUI
 
-[build-dependencies]
-winres = "0.1"
+# [build-dependencies]
+# winres = "0.1"
