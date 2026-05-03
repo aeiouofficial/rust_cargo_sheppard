@@ -1,8 +1,6 @@
-# 🐑 rust_cargo_sheppard
+# 🐑 cargo-shepherd
 
-<img width="1536" height="1024" alt="aa6d2fbc-f767-49bd-b4a7-dca177b4b5d1" src="https://github.com/user-attachments/assets/33bc3d80-c748-43b8-8a98-71f0389a8f59" />
-
-**A system-wide Cargo build coordinator for Windows 10/11, macOS, and Linux.**  
+> **A system-wide Cargo build coordinator for Windows 10/11, macOS, and Linux.**  
 > Prevents multiple Rust projects open in parallel VSCode windows from fighting each other, maxing out your CPU/RAM, and deadlocking on Cargo's file locks — with a full interactive TUI dashboard and persistent per-project configuration.
 
 ---
