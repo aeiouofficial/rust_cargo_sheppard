@@ -71,7 +71,7 @@ The daemon runs a **true priority scheduler**: five priority levels (Background 
 | **Live slot control** | Change concurrent build count without restarting the daemon |
 | **Resource gating** | Daemon pauses scheduling if CPU or RAM headroom is low |
 | **sccache integration** | Pairs with Mozilla's compiler cache to share artifacts across projects |
-| **Cross-platform** | Windows (Named Pipes), macOS/Linux (Unix Sockets) — same binary |
+| Windows (Named Pipes), (untested on macOS/Linux (Unix Sockets) — same binary should work with some tweaking) |
 
 
 <img width="1254" height="334" alt="taskbar_preview" src="https://github.com/user-attachments/assets/34e4ac6d-0812-45e6-9c8d-5b7c5075c91d" />
