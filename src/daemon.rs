@@ -23,7 +23,10 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info};
 
 use crate::config::{slot_limit_label, GlobalConfig};
-use crate::ipc::{ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, RunningJobSource, StatusReport};
+use crate::ipc::{
+    ClientMsg, DaemonMsg, QueuedJobSnapshot, QueuedJobSource, RunningJob, RunningJobSource,
+    StatusReport,
+};
 use crate::monitor::ResourceMonitor;
 use crate::queue::{PriorityQueue, QueuedJob};
 use crate::runner::CargoRunner;
@@ -60,6 +63,9 @@ impl SharedState {
         let queued = self.queue.snapshot();
         let now = Utc::now();
         let managed_pids = self.managed_pids();
+        let external =
+            self.monitor
+                .reconcile_external_herd(&managed_pids, &self.config, self.active);
 
         let mut running: Vec<RunningJob> = self
             .running
@@ -73,36 +79,57 @@ impl SharedState {
                 job
             })
             .collect();
-        running.extend(self.monitor.external_cargo_jobs(&managed_pids, &self.config));
+        running.extend(external.running);
+
+        let mut queued_snapshots: Vec<QueuedJobSnapshot> = queued
+            .iter()
+            .map(|j| QueuedJobSnapshot {
+                job_id: j.job_id.clone(),
+                project_dir: j.project_dir.clone(),
+                alias: j.alias.clone(),
+                args: j.args.clone(),
+                priority: j.priority,
+                queued_at: j.queued_at,
+                source: QueuedJobSource::Sheppard,
+                pid: None,
+                child_count: 0,
+                reason: None,
+                position: 0,
+            })
+            .collect();
+        queued_snapshots.extend(external.queued);
+        for (position, job) in queued_snapshots.iter_mut().enumerate() {
+            job.position = position;
+        }
+
+        let herd_active_external = running
+            .iter()
+            .filter(|job| job.source == RunningJobSource::ExternalRust)
+            .count();
+        let herd_held_external = queued_snapshots
+            .iter()
+            .filter(|job| job.source == QueuedJobSource::SuspendedExternalRust)
+            .count();
 
         StatusReport {
             slots_active: running.len(),
             running,
-            queued: queued
-                .iter()
-                .enumerate()
-                .map(|(i, j)| QueuedJobSnapshot {
-                    job_id: j.job_id.clone(),
-                    project_dir: j.project_dir.clone(),
-                    alias: j.alias.clone(),
-                    args: j.args.clone(),
-                    priority: j.priority,
-                    queued_at: j.queued_at,
-                    position: i,
-                })
-                .collect(),
+            queued: queued_snapshots,
             slots_total: self.config.slots,
             cpu_pct: self.monitor.cpu_usage(),
             ram_pct: self.monitor.ram_usage_pct(),
+            herd_unmanaged: self.config.herd_unmanaged,
+            herd_ram_pause_pct: self.config.herd_ram_pause_pct,
+            herd_ram_resume_pct: self.config.herd_ram_resume_pct,
+            herd_scan_ms: self.config.herd_scan_ms,
+            herd_max_active: self.config.herd_max_active,
+            herd_active_external,
+            herd_held_external,
         }
     }
 
     fn can_start_another(&mut self) -> bool {
-        let managed_pids = self.managed_pids();
-        let adopted_external = self
-            .monitor
-            .external_cargo_jobs(&managed_pids, &self.config)
-            .len();
+        let adopted_external = self.monitor.active_external_count();
         let active_builds = self.active + adopted_external;
 
         (self.config.slots == 0 || active_builds < self.config.slots)
@@ -263,10 +290,22 @@ impl SharedState {
         }
 
         let managed_pids = self.managed_pids();
-        let external_jobs = self.monitor.external_cargo_jobs(&managed_pids, &self.config);
-        for job in external_jobs {
-            if job.project_dir == project_dir && self.monitor.kill_external_cargo_pid(job.pid) {
+        let external_jobs =
+            self.monitor
+                .reconcile_external_herd(&managed_pids, &self.config, self.active);
+        for job in external_jobs.running {
+            if job.project_dir == project_dir && self.monitor.kill_external_rust_pid(job.pid) {
                 killed_running += 1;
+            }
+        }
+
+        for job in external_jobs.queued {
+            if job.project_dir == project_dir {
+                if let Some(pid) = job.pid {
+                    if self.monitor.kill_external_rust_pid(pid) {
+                        killed_running += 1;
+                    }
+                }
             }
         }
 
@@ -307,6 +346,21 @@ fn notify_attached_queued_job(job: &QueuedJob, message: String) {
     if let Some(tx) = &job.attached_tx {
         let _ = tx.send(DaemonMsg::Error { message });
     }
+}
+
+fn format_herd_config(config: &GlobalConfig) -> String {
+    format!(
+        "Passive herding {} (pause {:.1}% RAM, resume {:.1}% RAM, scan {} ms, max active {})",
+        if config.herd_unmanaged {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.herd_ram_pause_pct,
+        config.herd_ram_resume_pct,
+        config.herd_scan_ms,
+        config.herd_max_active,
+    )
 }
 
 // ─────────────────────────── Daemon ──────────────────────────────────────────
@@ -435,7 +489,8 @@ async fn scheduler_loop(
     notify: Arc<Notify>,
     spawn_tx: mpsc::UnboundedSender<QueuedJob>,
 ) {
-    let mut resource_poll = tokio::time::interval(std::time::Duration::from_millis(1000));
+    let poll_ms = state.lock().await.config.herd_scan_ms.max(100);
+    let mut resource_poll = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
     resource_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     resource_poll.tick().await;
 
@@ -447,6 +502,11 @@ async fn scheduler_loop(
 
         let mut s = state.lock().await;
         s.monitor.refresh();
+        let managed_pids = s.managed_pids();
+        let active = s.active;
+        let config = s.config.clone();
+        s.monitor
+            .reconcile_external_herd(&managed_pids, &config, active);
 
         while s.can_start_another() {
             if let Some(job) = s.queue.pop_next() {
@@ -512,7 +572,15 @@ async fn runner_pool(
 
             let start = Instant::now();
 
-            match CargoRunner::spawn(&project_dir, &args, &job_id, child_jobs, attached_tx.clone()).await {
+            match CargoRunner::spawn(
+                &project_dir,
+                &args,
+                &job_id,
+                child_jobs,
+                attached_tx.clone(),
+            )
+            .await
+            {
                 Ok(mut runner) => {
                     // Update PID
                     {
@@ -1059,6 +1127,40 @@ where
                 }
             }
 
+            // ── Config: set passive herding options ──────────────────────────
+            ClientMsg::SetHerdConfig {
+                herd_unmanaged,
+                herd_ram_pause_pct,
+                herd_ram_resume_pct,
+                herd_scan_ms,
+                herd_max_active,
+            } => {
+                let mut s = state.lock().await;
+                match s.config.set_herd_config(
+                    herd_unmanaged,
+                    herd_ram_pause_pct,
+                    herd_ram_resume_pct,
+                    herd_scan_ms,
+                    herd_max_active,
+                ) {
+                    Ok(_) => {
+                        let message = format_herd_config(&s.config);
+                        drop(s);
+                        notify.notify_one();
+                        send(&mut writer, &DaemonMsg::ConfigUpdated { message }).await?
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Error {
+                                message: format!("Config save failed: {}", e),
+                            },
+                        )
+                        .await?
+                    }
+                }
+            }
+
             // ── Status ────────────────────────────────────────────────────────
             ClientMsg::Status => {
                 let report = state.lock().await.status_report();
@@ -1159,7 +1261,8 @@ mod tests {
 
     #[test]
     fn status_report_updates_running_elapsed_time() {
-        let config = GlobalConfig::default();
+        let mut config = GlobalConfig::default();
+        config.herd_unmanaged = false; // don't scan live processes in unit tests
         let mut state = SharedState::new(config);
         let (kill_tx, _kill_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1182,8 +1285,12 @@ mod tests {
 
         let report = state.status_report();
 
-        assert_eq!(report.running.len(), 1);
-        assert!(report.running[0].elapsed_ms >= 1000);
+        let managed = report
+            .running
+            .iter()
+            .find(|job| job.job_id == "job-1")
+            .expect("managed job should remain in the status snapshot");
+        assert!(managed.elapsed_ms >= 1000);
     }
 
     #[test]

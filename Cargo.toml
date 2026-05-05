@@ -1,6 +1,6 @@
 [package]
 name = "cargo-shepherd"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "System-wide Cargo build coordinator — priority queue, TUI, persistent config"
 license = "MIT"
@@ -29,7 +29,7 @@ toml         = "0.8"       # config file parsing
 dirs         = "5"         # XDG / platform-correct config paths
 
 [target.'cfg(windows)'.dependencies]
-winapi       = { version = "0.3", features = ["libloaderapi", "shellapi", "winuser"] }
+winapi       = { version = "0.3", features = ["handleapi", "libloaderapi", "processthreadsapi", "shellapi", "tlhelp32", "wincon", "winnt", "winuser"] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TUI deps (always included — shepherd ui tui)

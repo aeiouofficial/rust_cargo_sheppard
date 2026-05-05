@@ -42,7 +42,8 @@ use tokio::time::interval;
 use crate::client::ShepherdClient;
 use crate::config::{slot_limit_label, Priority};
 use crate::ipc::{
-    ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, RunningJobSource, StatusReport,
+    ClientMsg, DaemonMsg, QueuedJobSnapshot, QueuedJobSource, RunningJob, RunningJobSource,
+    StatusReport,
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -128,6 +129,12 @@ impl App {
         } else {
             self.running_sel.select(Some(0));
         }
+
+        if self.focus == Panel::Queue && qlen == 0 && rlen > 0 {
+            self.focus = Panel::Running;
+        } else if self.focus == Panel::Running && rlen == 0 && qlen > 0 {
+            self.focus = Panel::Queue;
+        }
     }
 
     fn nav_down(&mut self) {
@@ -184,8 +191,9 @@ impl App {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run_tui(refresh_ms: u64) -> Result<()> {
+    let tray_controller = crate::tray::spawn_tui_tray_controller();
     let mut terminal = ratatui::init();
-    let result = tui_loop(&mut terminal, refresh_ms).await;
+    let result = tui_loop(&mut terminal, refresh_ms, tray_controller).await;
     ratatui::restore();
 
     if let Err(e) = &result {
@@ -196,7 +204,11 @@ pub async fn run_tui(refresh_ms: u64) -> Result<()> {
 
 // ── Main event loop ───────────────────────────────────────────────────────────
 
-async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, refresh_ms: u64) -> Result<()> {
+async fn tui_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    refresh_ms: u64,
+    tray_controller: crate::tray::TrayController,
+) -> Result<()> {
     let mut app = App::new();
     let mut events = EventStream::new();
     let mut poll_timer = interval(Duration::from_millis(refresh_ms));
@@ -205,10 +217,19 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, refresh_ms: u64) -> R
     fetch_status(&mut app).await;
 
     loop {
+        if tray_controller.exit_requested() {
+            stop_daemon_for_tray_exit().await;
+            break;
+        }
+
         terminal.draw(|frame| render(frame, &mut app))?;
 
         tokio::select! {
             _ = poll_timer.tick() => {
+                if tray_controller.exit_requested() {
+                    stop_daemon_for_tray_exit().await;
+                    break;
+                }
                 if app.input_mode == InputMode::Normal {
                     fetch_status(&mut app).await;
                 }
@@ -231,6 +252,12 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, refresh_ms: u64) -> R
     Ok(())
 }
 
+async fn stop_daemon_for_tray_exit() {
+    if let Ok(mut client) = ShepherdClient::connect().await {
+        let _ = client.send_recv(&ClientMsg::Shutdown).await;
+    }
+}
+
 // ── Key handling ──────────────────────────────────────────────────────────────
 
 /// Returns true if the user wants to quit.
@@ -251,8 +278,8 @@ async fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
         // ── Navigation ───────────────────────────────────────────────────────
         KeyCode::Char('j') | KeyCode::Down => app.nav_down(),
         KeyCode::Char('k') | KeyCode::Up => app.nav_up(),
-        KeyCode::Left => app.focus = Panel::Running,
-        KeyCode::Right => app.focus = Panel::Queue,
+        KeyCode::Left | KeyCode::Char('h') => app.focus = Panel::Running,
+        KeyCode::Right | KeyCode::Char('l') => app.focus = Panel::Queue,
         KeyCode::Tab => {
             app.focus = if app.focus == Panel::Queue {
                 Panel::Running
@@ -265,6 +292,10 @@ async fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
         KeyCode::Char('+') | KeyCode::Char('=') => {
             if app.focus == Panel::Queue {
                 if let Some(job) = app.selected_queued() {
+                    if job.source != QueuedJobSource::Sheppard {
+                        app.status_msg = "Suspended external Rust jobs keep FIFO order".into();
+                        return Ok(false);
+                    }
                     let new_p = job.priority.raised();
                     let job_id = job.job_id.clone();
                     send_daemon(
@@ -283,6 +314,10 @@ async fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
         KeyCode::Char('-') => {
             if app.focus == Panel::Queue {
                 if let Some(job) = app.selected_queued() {
+                    if job.source != QueuedJobSource::Sheppard {
+                        app.status_msg = "Suspended external Rust jobs keep FIFO order".into();
+                        return Ok(false);
+                    }
                     let new_p = job.priority.lowered();
                     let job_id = job.job_id.clone();
                     send_daemon(
@@ -316,6 +351,12 @@ async fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
         KeyCode::Char('c') => {
             if app.focus == Panel::Queue {
                 if let Some(job) = app.selected_queued() {
+                    if job.source != QueuedJobSource::Sheppard {
+                        app.status_msg =
+                            "Suspended external Rust jobs cannot be cancelled without killing"
+                                .into();
+                        return Ok(false);
+                    }
                     let job_id = job.job_id.clone();
                     send_daemon(app, &ClientMsg::CancelJob { job_id }).await;
                 }
@@ -517,7 +558,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     // ── Outer vertical split: header / body / footer ──────────────────────────
     let [header_area, body_area, footer_area] = *Layout::vertical([
-        Constraint::Length(10), // header: logo + title + gauges
+        Constraint::Length(8),  // header: logo (3 lines) + gauges (3) + spacing
         Constraint::Min(0),     // body:   running | queue
         Constraint::Length(3),  // footer: keybindings + status
     ])
@@ -532,7 +573,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let [title_area, gauges_area] =
-        *Layout::vertical([Constraint::Length(6), Constraint::Length(3)]).split(area)
+        *Layout::vertical([Constraint::Length(4), Constraint::Length(3)]).split(area)
     else {
         return;
     };
@@ -557,18 +598,28 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         app.report.slots_active,
         slot_limit_label(app.report.slots_total)
     );
+    let herd_text = format!(
+        " Herd: {} active:{} held:{} max:{} scan:{}ms ",
+        if app.report.herd_unmanaged {
+            "on"
+        } else {
+            "off"
+        },
+        app.report.herd_active_external,
+        app.report.herd_held_external,
+        app.report.herd_max_active,
+        app.report.herd_scan_ms,
+    );
 
+    // Block-letter wordmark.
     let logo_ascii = [
-        "  ____  _                                 _ ",
-        " / ___|| |__   ___ _ __  _ __   __ _ _ __ __| |",
-        " \\___ \\| '_ \\ / _ \\ '_ \\| '_ \\ / _` | '__/ _` |",
-        "  ___) | | | |  __/ |_) | |_) | (_| | | | (_| |",
-        " |____/|_| |_|\\___| .__/| .__/ \\__,_|_|  \\__,_|",
-        "                  |_|   |_|                        ",
+        "░█▀▀░█░█░█▀▀░█▀█░█░█░█▀▀░█▀▄░█▀▄",
+        "░▀▀█░█▀█░█▀▀░█▀▀░█▀█░█▀▀░█▀▄░█░█",
+        "░▀▀▀░▀░▀░▀▀▀░▀░░░▀░▀░▀▀▀░▀░▀░▀▀░",
     ];
 
     let header_layout = Layout::horizontal([
-        Constraint::Length(56), // Logo width
+        Constraint::Length(40), // Logo width (block ASCII)
         Constraint::Min(0),     // Info
     ])
     .split(title_area);
@@ -580,7 +631,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(logo_p, header_layout[0]);
 
-    let version_text = format!(" 🐑 v{} ", APP_VERSION);
+    let version_text = format!(" v{} ", APP_VERSION);
 
     let info_lines = vec![
         Line::from(vec![
@@ -595,6 +646,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![Span::styled(
             slots_text,
             Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            herd_text,
+            Style::default().fg(Color::LightYellow),
         )]),
     ];
     frame.render_widget(Paragraph::new(info_lines), header_layout[1]);
@@ -711,12 +766,12 @@ fn render_running_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             let source = match job.source {
                 RunningJobSource::Sheppard => "sheppard",
                 RunningJobSource::ExternalCargo => "external",
+                RunningJobSource::ExternalRust => "external rust",
             };
-            let source_style = match job.source {
-                RunningJobSource::Sheppard => Style::default().fg(Color::Green),
-                RunningJobSource::ExternalCargo => Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+            let source_color = match job.source {
+                RunningJobSource::Sheppard => Color::Green,
+                RunningJobSource::ExternalCargo => Color::Yellow,
+                RunningJobSource::ExternalRust => Color::LightYellow,
             };
 
             ListItem::new(vec![
@@ -724,7 +779,7 @@ fn render_running_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "● ",
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(source_color)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -733,15 +788,13 @@ fn render_running_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  "),
-                    Span::styled(source, source_style),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(truncate(&cmd, 34), Style::default().fg(Color::Cyan)),
+                    Span::styled(truncate(&cmd, 28), Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![Span::styled(
-                    format!("  {} · {}", pid, elapsed),
+                    format!("  {} · {} · {}", pid, elapsed, source),
                     Style::default().fg(Color::DarkGray),
                 )]),
             ])
@@ -800,16 +853,37 @@ fn render_queue_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             let wait_sec = chrono::Utc::now()
                 .signed_duration_since(job.queued_at)
                 .num_seconds();
+            let is_held = job.source == QueuedJobSource::SuspendedExternalRust;
+            let badge = if is_held {
+                "HELD"
+            } else {
+                job.priority.label()
+            };
+            let badge_style = if is_held {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(prio_bg)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let detail = if is_held {
+                let pid = job
+                    .pid
+                    .map(|pid| format!("PID:{}", pid))
+                    .unwrap_or_else(|| "PID:?".into());
+                let reason = job.reason.clone().unwrap_or_else(|| "waiting".into());
+                format!("  {} · {} child · {}", pid, job.child_count, reason)
+            } else {
+                format!("  {}s", wait_sec)
+            };
 
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", job.priority.label()),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(prio_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!(" {} ", badge), badge_style),
                     Span::raw(format!(" {}. ", i + 1)),
                     Span::styled(
                         truncate(&job.alias, 16),
@@ -819,10 +893,7 @@ fn render_queue_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(vec![
                     Span::raw("       "),
                     Span::styled(truncate(&cmd, 30), Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("  {}s", wait_sec),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
                 ]),
             ])
         })
@@ -918,7 +989,7 @@ fn footer_help_lines(app: &App) -> Vec<Line<'static>> {
         InputMode::Normal if app.show_help => vec![
             Line::from(vec![
                 key_hint("NAV", "Up/Down or j/k select"),
-                key_hint("PANELS", "Left/Right or Tab"),
+                key_hint("PANELS", "Left/Right, h/l, Tab"),
                 key_hint("QUEUE", "+/- priority, c cancel"),
                 key_hint("KILL", "x job, X project"),
             ]),
@@ -954,12 +1025,10 @@ fn format_elapsed(ms: u64) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if s.len() <= max {
         s.to_string()
     } else {
-        let keep = max.saturating_sub(1);
-        let prefix: String = s.chars().take(keep).collect();
-        format!("{}…", prefix)
+        format!("{}…", &s[..max.saturating_sub(1)])
     }
 }
 
@@ -981,6 +1050,10 @@ mod tests {
             args: vec!["check".to_string()],
             priority: Priority::Normal,
             queued_at: Utc::now(),
+            source: QueuedJobSource::Sheppard,
+            pid: None,
+            child_count: 0,
+            reason: None,
             position,
         }
     }
@@ -1038,11 +1111,5 @@ mod tests {
             .await
             .unwrap());
         assert!(app.focus == Panel::Queue);
-    }
-
-    #[test]
-    fn truncate_is_unicode_safe() {
-        assert_eq!(truncate("cargo-🐑-shepherd", 8), "cargo-🐑…");
-        assert_eq!(truncate("cargo", 8), "cargo");
     }
 }

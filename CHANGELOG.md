@@ -2,118 +2,90 @@
 
 All notable cargo-shepherd changes are recorded here.
 
-## 2026-05-05 - Shim coordination smoke verification
+## 2026-05-05 - v1.2.0 — Tray UX, Console Icon & Startup Takeover Fixes
 
-### Verified
+Finally fixed the tray icon on Windows. The double-click was silently failing because the message handler was truncating the event word on 64-bit Windows, and the right-click menu wasn't dispatching either. Now both work reliably—double-click restores the dashboard, right-click opens the menu.
 
-- Redeployed `target_verify_ext_0505d\debug\shepherd.exe` (length 10 423 808
-  bytes, LastWriteTime 2026-05-05 12:18:42) to `shepherd.exe`,
-  `bin\shepherd.exe`, and `bin\shim\cargo.exe`.
-- Live-verified the full shim coordination matrix: `shepherd run` queue,
-  shim-attached drain (`cargo --version` streamed, exit 0), shim-attached
-  queue under low-resource gates, CLI cancel while shim is queued (shim
-  exits 1 with the daemon's cancellation message), client-disconnect
-  auto-cancellation (killing the queued shim removes the job), source
-  labels (`sheppard` vs `external`), and shim path is never double-counted
-  as an external Cargo process.
-- Documented the verified matrix in `docs/SMOKE_TEST_RESULTS.md` with the
-  exact command shape used to reproduce it.
+We also fixed the console icon so Sheppard shows up properly in the taskbar and title bar instead of showing the generic Windows icon. And the TUI wordmark is back to the clean 3-line ASCII you wanted (compacted header to save space).
 
-### Documentation
-
-- Created backups in `bin/doc_backups_2026-05-05_shim/` of the previous
-  `CHANGELOG.md` and `docs/SMOKE_TEST_RESULTS.md` before this update.
-
-## 2026-05-05 - Cargo shim coordination repair
-
-### Fixed
-
-- Replaced default runtime killing of unmanaged `cargo.exe` roots with an attached Cargo shim path. When `shepherd.exe` is copied or linked as `cargo.exe`, raw `cargo ...` commands now queue through the daemon, stream stdout/stderr back to the caller, and return Cargo's real exit code.
-- Added attached IPC messages for queued, started, output, finished, and error events so machine-readable commands such as `cargo metadata` keep working while Sheppard owns scheduling.
-- Made the daemon scheduler wake periodically while jobs are queued, so CPU/RAM-gated jobs automatically start after resource pressure clears.
-- Made startup process termination opt-in via `SHEPHERD_TAKEOVER_EXISTING_CARGO=1`; Sheppard no longer kills existing or future Cargo starts by default.
-- Updated Windows launchers to create `bin\shim\cargo.exe`, prepend it for the launcher session, and optionally install it into the user PATH with `SHEPHERD_INSTALL_USER_SHIM=1`.
-
-### Documentation
-
-- Created documentation backups in `bin/doc_backups_2026-05-05_shim` before editing README, changelog, feature, reproducibility, and release changelog documentation.
-- Updated README, feature, and reproducibility guidance to describe shim-based Cargo coordination and the opt-in emergency takeover flag.
-
-## 2026-05-05 - Audit cycle and takeover hardening
-
-### Fixed
-
-- Added continuous daemon enforcement for unmanaged external `cargo.exe` roots after startup, while preserving Sheppard-owned builds and skipping enforcement while a managed spawn has not recorded its PID yet.
-- Made startup takeover wait briefly for killed Rust build processes to exit so stale Cargo locks are less likely to survive daemon launch.
-- Added the documented `Shell_NotifyIconW(NIM_SETVERSION)` step with `NOTIFYICON_VERSION_4` after adding the Windows tray icon.
-- Avoided destroying the shared fallback Windows application icon; only file-loaded tray icons are destroyed.
-- Made launcher packaged-executable lookup root-based so the same PowerShell launcher works from root or `bin`.
-- Synchronized root source, manifests, lockfile, assets, launchers, `build_island`, release bundle, and `bin` launcher copies to v1.0.0 behavior.
-
-### Documentation
-
-- Created documentation backups in `bin/doc_backups_2026-05-05` before editing project docs.
-- Replaced stale v0.2.0 release-bundle references with `cargo_sheppard_v1.0.0_release`.
-- Added the missing UI design system document referenced by the README.
-- Updated audit, feature, reproducibility, and smoke-test docs for takeover, external Cargo enforcement, tray behavior, and source-tree synchronization.
-
-## 2026-05-05 - External Cargo adoption repair
-
-### Fixed
-
-- Made the daemon adopt already-running external `cargo.exe` processes into status snapshots as `external-<pid>` running jobs.
-- Made daemon startup take coordinator position by terminating existing raw `cargo`/`rustc`/`rust-lld` processes before listening; set `SHEPHERD_PRESERVE_EXISTING_CARGO=1` only for emergency opt-out.
-- Counted adopted external Cargo processes against active slots so Sheppard does not schedule as if the machine is idle.
-- Allowed kill controls to terminate adopted external Cargo processes by their `external-<pid>` job IDs, including project-level kill matching by working directory.
-- Restored the TUI ASCII wordmark while spelling `Sheppard` correctly, and sourced the displayed version from Cargo package metadata instead of a stale hardcoded value.
-- Added a Windows notification-area tray icon while the daemon is active.
-- Made launchers prefer the freshly built root `shepherd.exe`, rebuild automatically when source/assets are newer than the selected executable, and restart any existing daemon so takeover code always runs.
-
-## 2026-05-04 - v1.0.0 release
+The big one: startup takeover now actually works by default. Previously it was opt-in (`SHEPHERD_TAKEOVER_EXISTING_CARGO=1`), so other tools like OpenLLM's launcher could still find and kill `cargo`/`rustc` processes that Sheppard wasn't monitoring. Now startup takeover runs automatically when `herd_unmanaged = true` and uses the same Rust activity matcher as live herding (`cargo`, `rustc`, `rust-lld`, `rustdoc`, `clippy-driver`, `rustfmt`, and `cargo-*` tools). You can opt out with `SHEPHERD_TAKEOVER_EXISTING_CARGO=0` if needed.
 
 ### Changed
 
-- Bumped version to 1.0.0. All smoke tests pass, 20/20 unit tests pass.
+- The release folder is now `cargo_sheppard_v1.2.0_release/` (was `v1.1.0_release/`). The source code, manifests, and headers stay synced with root.
+- Tray tooltips are clearer now: `"Sheppard dashboard (double-click to open, right-click for menu)"` in TUI mode, and `"Sheppard daemon (right-click for menu)"` in daemon-only mode.
+- Version bump: `1.1.0` → `1.2.0` across all three `Cargo.toml` files (root, `build_island/`, and the release folder). The TUI header and `--version` output now show `1.2.0`.
+
+### Notes
+
+- All 20 unit tests pass, including new coverage for the shared Rust-activity matcher that startup takeover uses.
+- Release binary SHA-256 (identical across all four deployment targets): `892AC2F08D0032945838396A28222CE5E8F6501327DC6FA5E53E007951A2DEB6`.
+- Doc snapshots from before this release are in `bin/doc_backups_2026-05-05_v1.2.0_pre/` and `bin/doc_backups_2026-05-05_v1.2.0_takeover_pre/`.
+
+## 2026-05-05 - v1.1.0 — Passive Rust Herding Supervisor
+
+The big addition is passive Rust herding. Sheppard now watches any external Rust build process (`cargo`, `rustc`, `rust-lld`, `rustdoc`, `clippy-driver`, `rustfmt`, `cargo-*`) that's running outside of its queue—so if you kick off a build from another tool, Sheppard sees it and can manage it without killing it.
+
+Instead of just terminating processes, Sheppard uses Windows suspend/resume to pause external builds when RAM exceeds your limit (75% by default) and automatically wakes them up once usage drops back to 70%. You can configure all of this: scan interval, pause/resume thresholds, and how many external builds can run at once (`herd_max_active`, default 1). The TUI shows held jobs with a `HELD` badge, RAM reason, and process info.
+
+We also added proper tray support: minimize the TUI to the system tray, double-click to restore it, right-click for a menu with Open and Exit options. The TUI can now auto-focus the active panel, and you can use `h`/`l` as shortcuts to switch panels alongside the arrow keys. The header now pulls the actual version number from the Cargo manifest instead of a hardcoded string, so it'll always show the right version.
+
+There's a bunch of new config options too: `herd_unmanaged`, `herd_ram_pause_pct`, `herd_ram_resume_pct`, `herd_scan_ms`, `herd_max_active`. You can tweak all of them live with `shepherd config herd` commands, and they're saved to your config file.
+
+On the launcher side, both `build_shepherd.bat` and `start_shepherd.bat` now delegate to PowerShell scripts instead of carrying old batch code. The IPC types got expanded to support the new external herding status info.
+
+Bumped version to 1.1.0, and the release folder is now `cargo_sheppard_v1.1.0_release/`. All doc changes are backed up in `bin/doc_backups_2026-05-05_v1.1.0_pre/`.
+
+## 2026-05-05 - Shim coordination smoke verification
+
+Deployed and tested the full shim coordination flow: queue, drain, streaming, exit codes, cancellation, and source labeling all work correctly. See `docs/SMOKE_TEST_RESULTS.md` for the exact test matrix and commands.
+
+Doc backups are in `bin/doc_backups_2026-05-05_shim/`.
+
+## 2026-05-05 - Cargo shim coordination repair
+
+Stopped killing external Cargo processes on startup and replaced it with an attached shim: if you copy or symlink `shepherd.exe` as `cargo.exe`, then raw `cargo ...` commands will route through Sheppard's queue, stream output back to you, and return the real Cargo exit code. So you still get Sheppard's scheduling and resource management, but tools that rely on `cargo metadata` or other machine-readable output still work.
+
+The daemon listens for IPC events (queued, started, output, finished, error) so the machine-readable part of Cargo still works properly. The scheduler also wakes up while jobs are queued so CPU/RAM gates work—jobs start automatically once resources are available.
+
+Startup process termination was made opt-in with `SHEPHERD_TAKEOVER_EXISTING_CARGO=1`, but v1.2.0 later flipped it back to default-on. Windows launchers now create `bin\shim\cargo.exe` and can optionally install it to your user PATH with `SHEPHERD_INSTALL_USER_SHIM=1`.
+
+Updated the README and docs to explain the shim approach and the takeover flag.
+
+## 2026-05-05 - Audit cycle and takeover hardening
+
+Added continuous daemon enforcement for unmanaged external Cargo processes after startup (while being careful not to interfere with Sheppard-owned builds or still-launching managed jobs). Startup takeover now waits briefly for killed processes to exit so stale Cargo locks don't cause issues later.
+
+Fixed the Windows tray icon registration (`Shell_NotifyIconW(NIM_SETVERSION)` with `NOTIFYICON_VERSION_4`), and made sure we don't accidentally destroy the fallback system icon—only file-loaded ones.
+
+Made the packaged executable lookup root-based so the same PowerShell launcher works from root or `bin`. Synchronized everything: root source, manifests, lockfile, assets, launchers, `build_island`, release bundle, and `bin` launcher copies to v1.0.0 behavior.
+
+Doc backups in `bin/doc_backups_2026-05-05`. Updated the audit, feature, reproducibility, and smoke-test docs with all the details on takeover, external Cargo enforcement, tray behavior, and source-tree sync. Cleaned up stale v0.2.0 release-bundle references and added the missing UI design system doc.
+
+## 2026-05-05 - External Cargo adoption repair
+
+Made the daemon adopt already-running external `cargo.exe` processes into status snapshots as `external-<pid>` running jobs instead of just killing them. The daemon now takes coordinator position on startup by terminating existing raw `cargo`/`rustc`/`rust-lld` processes before listening (set `SHEPHERD_PRESERVE_EXISTING_CARGO=1` only if you absolutely need to keep them).
+
+Adopted external processes count against active slots so Sheppard doesn't schedule as if the machine is idle. You can kill them by their `external-<pid>` job ID or by project-level directory matching.
+
+Fixed the TUI ASCII wordmark and made the version display come from the Cargo manifest instead of a hardcoded value. Added the Windows notification-area tray icon while the daemon is active.
+
+Improved the launchers to prefer the freshly built root `shepherd.exe`, rebuild automatically when source/assets are newer than the selected executable, and restart any existing daemon so takeover code always runs.
+
+## 2026-05-04 - v1.0.0 release
+
+Version 1.0.0 is here. All smoke tests pass, 20/20 unit tests pass.
 
 ## 2026-05-04 - Working app repair pass
 
-### Fixed
+Fixed CLI and TUI reliability: they no longer hang indefinitely when the daemon is missing (added a bounded named-pipe client retry), and status snapshots now show live CPU/RAM instead of zeros. Kill accounting was corrected so running-job termination works properly without prematurely freeing up slots.
 
-- Added a bounded Windows named-pipe client retry so CLI and TUI commands no longer hang indefinitely when the daemon is missing.
-- Refreshed resource monitor data when producing status snapshots so `shepherd status` and the TUI show live CPU/RAM instead of stale zero values.
-- Recomputed running job elapsed time at status snapshot time.
-- Corrected kill accounting so running-job kill requests signal the runner without decrementing active slots early.
-- Made persistent config commands usable when the daemon is not running by falling back to disk-backed config updates.
-- Canonicalized project directories for queue, config, and kill workflows.
-- Made per-project config match canonical path prefixes, with the most specific project entry winning.
-- Rejected `child-jobs 0` and normalized loaded `child_jobs` values to at least one Cargo job.
-- Made TUI truncation Unicode-safe so aliases or paths with non-ASCII characters cannot panic rendering.
-- Let `kill`, `cancel`, and `reprioritize` accept unique job ID prefixes, matching the eight-character IDs printed by status/run output; ambiguous prefixes return a clear error.
-- Made daemon-side CLI errors exit with status code 1 for status, kill, cancel, reprioritize, and config mutation commands.
-- Restored Windows icon embedding in the release manifest/build script through `winres`.
-- Reworked Windows launch/build scripts to use isolated target directories, retry lock failures, validate `SHEPHERD_SLOTS`, work from root or `bin`, and tolerate a locked root `shepherd.exe`.
-- Synchronized the stale `build_island` and release-bundle source trees with the verified root implementation.
+Config commands work even when the daemon isn't running (fall back to disk-backed config), and project paths are canonicalized so prefix matching works correctly. The TUI is now Unicode-safe and won't panic on non-ASCII characters. Short job ID prefixes work for kill/cancel/reprioritize commands, and the error messages are clear when a prefix is ambiguous.
 
-### Added
+Added automatic `sccache` support for child Cargo builds (when it's on PATH and `RUSTC_WRAPPER` isn't already set). Added a Root `build_shepherd.ps1` helper, MIT license file, and comprehensive docs (audit, features, UI design, reproducibility, smoke tests). Windows icon embedding works through `winres`. The launchers are now much more robust—they use isolated target directories, retry on lock failures, validate `SHEPHERD_SLOTS`, work from root or `bin`, and tolerate a locked `shepherd.exe`.
 
-- Automatic `sccache` enablement for child Cargo builds when `sccache` is on `PATH` and `RUSTC_WRAPPER` is not already set.
-- Root `build_shepherd.ps1` helper.
-- MIT `LICENSE` file matching the Cargo manifest and README badge.
-- Audit, feature, UI/design, reproducibility, and smoke-test documentation under `docs/`.
-- Regression tests for unlimited slots, prefix project config, child job normalization, running elapsed time, kill-slot accounting, missing command lookup, and Unicode-safe TUI truncation.
-- Regression tests for unique and ambiguous short job ID operations.
+Synced `build_island` and the release bundle source trees with the verified root. Added regression test coverage for unlimited slots, per-project config, child job normalization, running job elapsed time, kill accounting, missing command lookup, Unicode truncation, and short job ID operations.
 
-### Verified
+## 2026-05-03 - v0.2.0 handover baseline
 
-- Root: `cargo test --bin shepherd` passed 20/20.
-- Root: `cargo build --bin shepherd` passed.
-- `build_island`: `cargo test --bin shepherd --target-dir target_verify_final_0504` passed 20/20.
-- Release bundle: `cargo test --bin shepherd --target-dir target_verify_final_0504` passed 20/20.
-
-## 2026-05-03 - v0.2.0
-
-- Introduced priority queue scheduling.
-- Introduced Ratatui dashboard.
-- Added persistent config with project aliases and per-project settings.
-- Added launcher scripts and `SHEPHERD_SLOTS` support.
-- Documented `0` as unlimited job-level slot mode with CPU/RAM resource gates still active.
+The foundation: priority queue scheduling, Ratatui dashboard, persistent config with project aliases and per-project settings, launcher scripts, and `SHEPHERD_SLOTS` support. Also documented the `0` unlimited job-level slot mode with CPU/RAM resource gates still active.

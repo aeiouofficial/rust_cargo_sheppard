@@ -1,6 +1,7 @@
 // src/main.rs
 // cargo-shepherd — system-wide Cargo build coordinator
-// v1.0.0 — priority queue, TUI dashboard, persistent config
+// v1.2.0 — fixed Windows tray, restored block ASCII wordmark, and default
+// startup takeover of already-running Rust build processes.
 
 mod client;
 mod config;
@@ -27,7 +28,7 @@ use crate::monitor::ResourceMonitor;
 #[derive(Parser)]
 #[command(
     name    = "shepherd",
-    about   = "🐑 Sheppard — system-wide Cargo build coordinator",
+    about   = "Sheppard - system-wide Cargo build coordinator",
     version,
     long_about = None,
 )]
@@ -134,6 +135,29 @@ enum ConfigCmd {
 
         jobs: usize,
     },
+
+    /// Set passive herding options for unmanaged Rust build trees
+    Herd {
+        /// Enable/disable passive unmanaged Rust herding
+        #[arg(long)]
+        unmanaged: Option<bool>,
+
+        /// RAM percent at or above which unmanaged Rust trees are suspended
+        #[arg(long)]
+        pause_pct: Option<f64>,
+
+        /// RAM percent below which suspended unmanaged Rust trees are resumed
+        #[arg(long)]
+        resume_pct: Option<f64>,
+
+        /// Scan interval in milliseconds
+        #[arg(long)]
+        scan_ms: Option<u64>,
+
+        /// Max unmanaged Rust trees allowed to run at once
+        #[arg(long)]
+        max_active: Option<usize>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -221,7 +245,10 @@ fn run_real_cargo_directly(args: &[String]) -> Result<()> {
 fn invoked_as_cargo() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_stem().map(|name| name.to_string_lossy().to_string()))
+        .and_then(|path| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().to_string())
+        })
         .map(|stem| stem.eq_ignore_ascii_case("cargo"))
         .unwrap_or(false)
 }
@@ -250,7 +277,7 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
 
     tray::spawn_daemon_tray_icon();
 
-    if std::env::var("SHEPHERD_TAKEOVER_EXISTING_CARGO").ok().as_deref() == Some("1") {
+    if takeover_existing_rust_enabled(&live_config) {
         let killed = ResourceMonitor::kill_existing_rust_build_processes();
         if !killed.is_empty() {
             let summary = killed
@@ -260,7 +287,7 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
                 .join(", ");
             println!(
                 "{} cleared {} existing Rust build process(es): {}",
-                "🐑 Sheppard takeover —".yellow().bold(),
+                "Sheppard takeover -".yellow().bold(),
                 killed.len().to_string().yellow().bold(),
                 summary.dimmed(),
             );
@@ -269,12 +296,23 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
 
     println!(
         "{} {} build slot(s)  |  config: {}",
-        "🐑 Sheppard daemon starting —".cyan().bold(),
+        "Sheppard daemon starting -".cyan().bold(),
         slot_limit_label(effective_slots).yellow().bold(),
         GlobalConfig::config_path()?.display().to_string().dimmed(),
     );
 
     daemon::Daemon::run(live_config).await
+}
+
+fn takeover_existing_rust_enabled(config: &GlobalConfig) -> bool {
+    match std::env::var("SHEPHERD_TAKEOVER_EXISTING_CARGO") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => config.herd_unmanaged,
+            "0" | "false" | "off" | "no" => false,
+            _ => true,
+        },
+        Err(_) => config.herd_unmanaged,
+    }
 }
 
 async fn cmd_run(args: Vec<String>, dir: Option<String>, priority_str: String) -> Result<()> {
@@ -317,12 +355,20 @@ async fn cmd_status() -> Result<()> {
     match client.send_recv(&ClientMsg::Status).await? {
         DaemonMsg::StatusReport { report } => {
             println!(
-                "\n{}  slots {}/{}  CPU {:.1}%  RAM {:.1}%",
-                "═══ Sheppard ═══".cyan().bold(),
+                "\n{}  slots {}/{}  CPU {:.1}%  RAM {:.1}%  herd {} active:{} held:{} max:{}",
+                "=== Sheppard ===".cyan().bold(),
                 report.slots_active,
                 slot_limit_label(report.slots_total),
                 report.cpu_pct,
                 report.ram_pct,
+                if report.herd_unmanaged { "on" } else { "off" },
+                report.herd_active_external,
+                report.herd_held_external,
+                report.herd_max_active,
+            );
+            println!(
+                "  herd thresholds: pause RAM >= {:.1}%  resume RAM < {:.1}%  scan {} ms",
+                report.herd_ram_pause_pct, report.herd_ram_resume_pct, report.herd_scan_ms,
             );
 
             if report.running.is_empty() && report.queued.is_empty() {
@@ -337,6 +383,7 @@ async fn cmd_status() -> Result<()> {
                     let source = match job.source {
                         RunningJobSource::Sheppard => "sheppard",
                         RunningJobSource::ExternalCargo => "external",
+                        RunningJobSource::ExternalRust => "external-rust",
                     };
                     println!(
                         "  {:>36}  {}  PID:{:<7}  {}s  {}",
@@ -360,13 +407,30 @@ async fn cmd_status() -> Result<()> {
                         Priority::Low => job.priority.label().dimmed().to_string(),
                         Priority::Background => job.priority.label().dimmed().to_string(),
                     };
+                    let source = match job.source {
+                        crate::ipc::QueuedJobSource::Sheppard => prio_colored,
+                        crate::ipc::QueuedJobSource::SuspendedExternalRust => {
+                            "HELD".red().bold().to_string()
+                        }
+                    };
+                    let pid = job
+                        .pid
+                        .map(|pid| format!(" PID:{}", pid).dimmed().to_string())
+                        .unwrap_or_default();
+                    let reason = job
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(" ({})", reason).dimmed().to_string())
+                        .unwrap_or_default();
                     println!(
-                        "  {:>36}  [{}]  {}. {}  {}",
+                        "  {:>36}  [{}]  {}. {}{}  {}{}",
                         job.job_id[..8].dimmed(),
-                        prio_colored,
+                        source,
                         job.position + 1,
                         format!("cargo {}", job.args.join(" ")).cyan(),
+                        pid,
                         format!("[{}]", job.alias).yellow(),
+                        reason,
                     );
                 }
             }
@@ -568,9 +632,56 @@ async fn cmd_config(sub: ConfigCmd) -> Result<()> {
                 }
             }
         }
+
+        ConfigCmd::Herd {
+            unmanaged,
+            pause_pct,
+            resume_pct,
+            scan_ms,
+            max_active,
+        } => match ShepherdClient::connect().await {
+            Ok(mut client) => match client
+                .send_recv(&ClientMsg::SetHerdConfig {
+                    herd_unmanaged: unmanaged,
+                    herd_ram_pause_pct: pause_pct,
+                    herd_ram_resume_pct: resume_pct,
+                    herd_scan_ms: scan_ms,
+                    herd_max_active: max_active,
+                })
+                .await?
+            {
+                DaemonMsg::ConfigUpdated { message } => println!("{} {}", "✔".green(), message),
+                DaemonMsg::Error { message } => exit_with_error(&message),
+                _ => {}
+            },
+            Err(_) => {
+                let mut cfg = GlobalConfig::load()?;
+                cfg.set_herd_config(unmanaged, pause_pct, resume_pct, scan_ms, max_active)?;
+                println!(
+                    "{} {} (daemon not running)",
+                    "✔".green(),
+                    herd_config_label(&cfg)
+                );
+            }
+        },
     }
 
     Ok(())
+}
+
+fn herd_config_label(config: &GlobalConfig) -> String {
+    format!(
+        "Passive herding {} (pause {:.1}% RAM, resume {:.1}% RAM, scan {} ms, max active {})",
+        if config.herd_unmanaged {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.herd_ram_pause_pct,
+        config.herd_ram_resume_pct,
+        config.herd_scan_ms,
+        config.herd_max_active,
+    )
 }
 
 async fn cmd_stop() -> Result<()> {

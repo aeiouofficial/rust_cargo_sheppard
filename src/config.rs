@@ -123,6 +123,26 @@ pub struct GlobalConfig {
     /// How often the TUI polls the daemon for updates (milliseconds).
     pub ui_refresh_ms: u64,
 
+    /// Passively herd unmanaged Rust build processes launched outside Sheppard.
+    #[serde(default = "default_herd_unmanaged")]
+    pub herd_unmanaged: bool,
+
+    /// Suspend newly detected unmanaged Rust work once RAM reaches this percent.
+    #[serde(default = "default_herd_ram_pause_pct")]
+    pub herd_ram_pause_pct: f64,
+
+    /// Resume suspended unmanaged Rust work once RAM falls below this percent.
+    #[serde(default = "default_herd_ram_resume_pct")]
+    pub herd_ram_resume_pct: f64,
+
+    /// How often the daemon scans for unmanaged Rust process trees.
+    #[serde(default = "default_herd_scan_ms")]
+    pub herd_scan_ms: u64,
+
+    /// Max unmanaged Rust process trees allowed to run at once.
+    #[serde(default = "default_herd_max_active")]
+    pub herd_max_active: usize,
+
     /// Per-project overrides. Matched by canonicalized path prefix.
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
@@ -137,6 +157,11 @@ impl Default for GlobalConfig {
             child_jobs: 2,
             log_level: "info".into(),
             ui_refresh_ms: 500,
+            herd_unmanaged: true,
+            herd_ram_pause_pct: 75.0,
+            herd_ram_resume_pct: 70.0,
+            herd_scan_ms: 250,
+            herd_max_active: 1,
             projects: Vec::new(),
         }
     }
@@ -308,9 +333,42 @@ impl GlobalConfig {
         self.save()
     }
 
+    pub fn set_herd_config(
+        &mut self,
+        herd_unmanaged: Option<bool>,
+        herd_ram_pause_pct: Option<f64>,
+        herd_ram_resume_pct: Option<f64>,
+        herd_scan_ms: Option<u64>,
+        herd_max_active: Option<usize>,
+    ) -> Result<()> {
+        if let Some(value) = herd_unmanaged {
+            self.herd_unmanaged = value;
+        }
+        if let Some(value) = herd_ram_pause_pct {
+            self.herd_ram_pause_pct = value;
+        }
+        if let Some(value) = herd_ram_resume_pct {
+            self.herd_ram_resume_pct = value;
+        }
+        if let Some(value) = herd_scan_ms {
+            self.herd_scan_ms = value;
+        }
+        if let Some(value) = herd_max_active {
+            self.herd_max_active = value;
+        }
+
+        self.normalize_loaded_values();
+        self.save()
+    }
+
     fn normalize_loaded_values(&mut self) {
         self.slots = normalize_slots(self.slots);
         self.child_jobs = normalize_child_jobs(self.child_jobs);
+        self.herd_ram_pause_pct = normalize_pct(self.herd_ram_pause_pct, 75.0);
+        self.herd_ram_resume_pct = normalize_pct(self.herd_ram_resume_pct, 70.0)
+            .min(self.herd_ram_pause_pct.saturating_sub_f64(1.0));
+        self.herd_scan_ms = self.herd_scan_ms.max(100);
+        self.herd_max_active = self.herd_max_active.max(1);
         for project in &mut self.projects {
             if let Some(child_jobs) = project.child_jobs {
                 project.child_jobs = Some(normalize_child_jobs(child_jobs));
@@ -327,6 +385,44 @@ pub fn normalize_slots(slots: usize) -> usize {
 
 pub fn normalize_child_jobs(child_jobs: usize) -> usize {
     child_jobs.max(1)
+}
+
+fn normalize_pct(value: f64, default: f64) -> f64 {
+    if value.is_finite() && value > 0.0 && value <= 100.0 {
+        value
+    } else {
+        default
+    }
+}
+
+trait SaturatingSubF64 {
+    fn saturating_sub_f64(self, rhs: f64) -> f64;
+}
+
+impl SaturatingSubF64 for f64 {
+    fn saturating_sub_f64(self, rhs: f64) -> f64 {
+        (self - rhs).max(0.0)
+    }
+}
+
+fn default_herd_unmanaged() -> bool {
+    true
+}
+
+fn default_herd_ram_pause_pct() -> f64 {
+    75.0
+}
+
+fn default_herd_ram_resume_pct() -> f64 {
+    70.0
+}
+
+fn default_herd_scan_ms() -> u64 {
+    250
+}
+
+fn default_herd_max_active() -> usize {
+    1
 }
 
 pub fn slot_limit_label(slots: usize) -> String {

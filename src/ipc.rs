@@ -99,6 +99,15 @@ pub enum ClientMsg {
         child_jobs: usize,
     },
 
+    /// Update passive herding settings. Any None field leaves that setting unchanged.
+    SetHerdConfig {
+        herd_unmanaged: Option<bool>,
+        herd_ram_pause_pct: Option<f64>,
+        herd_ram_resume_pct: Option<f64>,
+        herd_scan_ms: Option<u64>,
+        herd_max_active: Option<usize>,
+    },
+
     // ── Queries ───────────────────────────────────────────────────────────────
     /// Get current status (running + queued jobs + resource stats).
     Status,
@@ -185,6 +194,13 @@ pub struct StatusReport {
     pub slots_active: usize,
     pub cpu_pct: f32,
     pub ram_pct: f64,
+    pub herd_unmanaged: bool,
+    pub herd_ram_pause_pct: f64,
+    pub herd_ram_resume_pct: f64,
+    pub herd_scan_ms: u64,
+    pub herd_max_active: usize,
+    pub herd_active_external: usize,
+    pub herd_held_external: usize,
 }
 
 impl StatusReport {
@@ -197,6 +213,13 @@ impl StatusReport {
             slots_active: 0,
             cpu_pct: 0.0,
             ram_pct: 0.0,
+            herd_unmanaged: false,
+            herd_ram_pause_pct: 75.0,
+            herd_ram_resume_pct: 70.0,
+            herd_scan_ms: 250,
+            herd_max_active: 1,
+            herd_active_external: 0,
+            herd_held_external: 0,
         }
     }
 }
@@ -219,6 +242,14 @@ pub struct RunningJob {
 pub enum RunningJobSource {
     Sheppard,
     ExternalCargo,
+    ExternalRust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedJobSource {
+    Sheppard,
+    SuspendedExternalRust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +267,18 @@ pub struct QueuedJobSnapshot {
     pub args: Vec<String>,
     pub priority: Priority,
     pub queued_at: DateTime<Utc>,
+    #[serde(default = "default_queue_source")]
+    pub source: QueuedJobSource,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub child_count: usize,
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Position in the queue (0 = next to run).
     pub position: usize,
+}
+
+fn default_queue_source() -> QueuedJobSource {
+    QueuedJobSource::Sheppard
 }

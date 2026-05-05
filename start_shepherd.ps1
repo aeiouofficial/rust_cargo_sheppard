@@ -41,7 +41,7 @@ try {
     Write-Host "Initializing cargo-shepherd..." -ForegroundColor Cyan
 
     $packagedExe = Join-Path $repoDir "bin\shepherd.exe"
-    $verifiedExe = Join-Path $repoDir "target_verify_exitcode_0504\debug\shepherd.exe"
+    $verifiedExe = Join-Path $repoDir "target_verify_herding_0505\release\shepherd.exe"
     $rootExe = Join-Path $repoDir "shepherd.exe"
     $shepherdExe = $null
 
@@ -140,6 +140,7 @@ try {
         $env:PATH = "$shimDir;$env:PATH"
     }
     Write-Host "Cargo shim ready: $cargoShim -> $realCargo" -ForegroundColor DarkGray
+    Write-Host "Passive Rust herding ready: unmanaged cargo/rustc trees are monitored and suspended instead of killed when gates close." -ForegroundColor DarkGray
 
     if ($env:SHEPHERD_INSTALL_USER_SHIM -eq "1") {
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -165,7 +166,14 @@ try {
     }
 
     Write-Host "Starting daemon silently in background (slots: $slotLabel)..." -ForegroundColor Green
+    $previousDaemonTray = $env:SHEPHERD_DAEMON_TRAY
+    $env:SHEPHERD_DAEMON_TRAY = "0"
     Start-Process -FilePath $shepherdExe -ArgumentList @("daemon", "--slots", $slots) -WorkingDirectory $repoDir -WindowStyle Hidden
+    if ($null -eq $previousDaemonTray) {
+        Remove-Item Env:SHEPHERD_DAEMON_TRAY -ErrorAction SilentlyContinue
+    } else {
+        $env:SHEPHERD_DAEMON_TRAY = $previousDaemonTray
+    }
 
     $ready = $false
     for ($attempt = 1; $attempt -le 10; $attempt++) {

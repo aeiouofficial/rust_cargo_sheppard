@@ -3,8 +3,8 @@
 // stdout/stderr are streamed to tracing at INFO level.
 // child_jobs controls CARGO_BUILD_JOBS (rustc thread count) per invocation.
 
-use anyhow::{Context, Result};
 use crate::ipc::{CargoOutputStream, DaemonMsg};
+use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
