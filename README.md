@@ -1,8 +1,8 @@
 # 🐑 cargo-shepherd 
 
 <img width="1536" height="1024" alt="aa6d2fbc-f767-49bd-b4a7-dca177b4b5d1" src="https://github.com/user-attachments/assets/98f04c4c-9ae5-4a6d-8473-d36e4635c645" />
+<img width="992" height="590" alt="image" src="https://github.com/user-attachments/assets/9e9a54d9-0130-47dc-a03b-3bd41806d1cb" />
 
-<img width="1420" height="803" alt="image" src="https://github.com/user-attachments/assets/9033a736-a3fb-4dcf-9dd4-bed36ea74667" />
 
 
 
