@@ -43,6 +43,16 @@ pub enum ClientMsg {
         priority: Option<Priority>,
     },
 
+    /// Queue a Cargo command and keep this IPC connection attached until it
+    /// finishes. Used by the `cargo.exe` shim so callers receive stdout,
+    /// stderr, and the real exit code while Sheppard owns scheduling.
+    RunAttached {
+        job_id: String,
+        project_dir: String,
+        args: Vec<String>,
+        priority: Option<Priority>,
+    },
+
     // ── Queue manipulation ────────────────────────────────────────────────────
     /// Change the priority of a queued (not yet running) job.
     SetJobPriority {
@@ -123,6 +133,13 @@ pub enum DaemonMsg {
         duration_ms: u64,
     },
 
+    /// One line of output from an attached Cargo process.
+    CargoOutput {
+        job_id: String,
+        stream: CargoOutputStream,
+        line: String,
+    },
+
     /// A job or set of jobs was killed or cancelled.
     Killed {
         description: String,
@@ -191,9 +208,24 @@ pub struct RunningJob {
     pub alias: String,
     pub args: Vec<String>,
     pub pid: u32,
+    pub source: RunningJobSource,
     pub started_at: DateTime<Utc>,
     /// Elapsed milliseconds (computed by daemon at snapshot time).
     pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunningJobSource {
+    Sheppard,
+    ExternalCargo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoOutputStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 // src/main.rs
 // cargo-shepherd — system-wide Cargo build coordinator
-// v0.2.0 — priority queue, TUI dashboard, persistent config
+// v1.0.0 — priority queue, TUI dashboard, persistent config
 
 mod client;
 mod config;
@@ -9,6 +9,7 @@ mod ipc;
 mod monitor;
 mod queue;
 mod runner;
+mod tray;
 mod tui;
 
 use anyhow::{Context, Result};
@@ -18,15 +19,16 @@ use uuid::Uuid;
 
 use crate::client::ShepherdClient;
 use crate::config::{slot_limit_label, GlobalConfig, Priority};
-use crate::ipc::{ClientMsg, DaemonMsg};
+use crate::ipc::{CargoOutputStream, ClientMsg, DaemonMsg, RunningJobSource};
+use crate::monitor::ResourceMonitor;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
     name    = "shepherd",
-    about   = "🐑 cargo-shepherd — system-wide Cargo build coordinator",
-    version = "0.2.0",
+    about   = "🐑 Sheppard — system-wide Cargo build coordinator",
+    version,
     long_about = None,
 )]
 struct Cli {
@@ -138,6 +140,11 @@ enum ConfigCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if invoked_as_cargo() {
+        cmd_cargo_shim().await?;
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -159,6 +166,64 @@ async fn main() -> Result<()> {
         }
         Cmd::Stop => cmd_stop().await,
     }
+}
+
+async fn cmd_cargo_shim() -> Result<()> {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    let project_dir = resolve_dir(None)?;
+    let job_id = Uuid::new_v4().to_string();
+
+    let mut client = match ShepherdClient::connect().await {
+        Ok(client) => client,
+        Err(_) => return run_real_cargo_directly(&args),
+    };
+
+    client
+        .send(&ClientMsg::RunAttached {
+            job_id: job_id.clone(),
+            project_dir,
+            args,
+            priority: None,
+        })
+        .await?;
+
+    loop {
+        match client.recv().await? {
+            DaemonMsg::Queued { .. } | DaemonMsg::Started { .. } => {}
+            DaemonMsg::CargoOutput { stream, line, .. } => match stream {
+                CargoOutputStream::Stdout => println!("{}", line),
+                CargoOutputStream::Stderr => eprintln!("{}", line),
+            },
+            DaemonMsg::Finished { exit_code, .. } => std::process::exit(exit_code),
+            DaemonMsg::Error { message } => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            }
+            other => {
+                eprintln!("Unexpected shepherd response: {:?}", other);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn run_real_cargo_directly(args: &[String]) -> Result<()> {
+    let status = std::process::Command::new(runner::resolve_real_cargo()?)
+        .args(args)
+        .status()
+        .context("failed to execute real cargo")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn invoked_as_cargo() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|name| name.to_string_lossy().to_string()))
+        .map(|stem| stem.eq_ignore_ascii_case("cargo"))
+        .unwrap_or(false)
 }
 
 // ── Command implementations ───────────────────────────────────────────────────
@@ -183,9 +248,28 @@ async fn cmd_daemon(slots: Option<usize>) -> Result<()> {
     let mut live_config = config;
     live_config.slots = effective_slots;
 
+    tray::spawn_daemon_tray_icon();
+
+    if std::env::var("SHEPHERD_TAKEOVER_EXISTING_CARGO").ok().as_deref() == Some("1") {
+        let killed = ResourceMonitor::kill_existing_rust_build_processes();
+        if !killed.is_empty() {
+            let summary = killed
+                .iter()
+                .map(|process| format!("{}:{}", process.name, process.pid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{} cleared {} existing Rust build process(es): {}",
+                "🐑 Sheppard takeover —".yellow().bold(),
+                killed.len().to_string().yellow().bold(),
+                summary.dimmed(),
+            );
+        }
+    }
+
     println!(
         "{} {} build slot(s)  |  config: {}",
-        "🐑 cargo-shepherd daemon starting —".cyan().bold(),
+        "🐑 Sheppard daemon starting —".cyan().bold(),
         slot_limit_label(effective_slots).yellow().bold(),
         GlobalConfig::config_path()?.display().to_string().dimmed(),
     );
@@ -234,7 +318,7 @@ async fn cmd_status() -> Result<()> {
         DaemonMsg::StatusReport { report } => {
             println!(
                 "\n{}  slots {}/{}  CPU {:.1}%  RAM {:.1}%",
-                "═══ cargo-shepherd ═══".cyan().bold(),
+                "═══ Sheppard ═══".cyan().bold(),
                 report.slots_active,
                 slot_limit_label(report.slots_total),
                 report.cpu_pct,
@@ -250,12 +334,17 @@ async fn cmd_status() -> Result<()> {
                 println!("\n{}", "  ● RUNNING".green().bold());
                 for job in &report.running {
                     let elapsed = job.elapsed_ms / 1000;
+                    let source = match job.source {
+                        RunningJobSource::Sheppard => "sheppard",
+                        RunningJobSource::ExternalCargo => "external",
+                    };
                     println!(
-                        "  {:>36}  {}  PID:{:<7}  {}s",
-                        job.job_id[..8].dimmed(),
+                        "  {:>36}  {}  PID:{:<7}  {}s  {}",
+                        short_id(&job.job_id).dimmed(),
                         format!("cargo {}", job.args.join(" ")).cyan(),
                         job.pid.to_string().dimmed(),
                         elapsed,
+                        source.dimmed(),
                     );
                     println!("  {:>36}  {}", "", format!("[{}]", job.alias).yellow());
                 }
@@ -520,4 +609,8 @@ fn parse_priority(s: &str) -> Result<Priority> {
 fn exit_with_error(message: &str) -> ! {
     eprintln!("{} {}", "✗".red(), message);
     std::process::exit(1);
+}
+
+fn short_id(job_id: &str) -> String {
+    job_id.chars().take(8).collect()
 }

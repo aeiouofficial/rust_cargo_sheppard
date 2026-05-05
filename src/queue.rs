@@ -7,7 +7,9 @@
 //   - FIFO ordering within the same priority level (earlier enqueue time wins)
 
 use crate::config::Priority;
+use crate::ipc::DaemonMsg;
 use chrono::{DateTime, Utc};
+use tokio::sync::mpsc;
 
 // ─────────────────────────── Job record ──────────────────────────────────────
 
@@ -20,6 +22,7 @@ pub struct QueuedJob {
     pub priority: Priority,
     pub queued_at: DateTime<Utc>,
     pub child_jobs: usize, // CARGO_BUILD_JOBS for this specific invocation
+    pub attached_tx: Option<mpsc::UnboundedSender<DaemonMsg>>,
 }
 
 // ─────────────────────────── PriorityQueue ───────────────────────────────────
@@ -120,6 +123,7 @@ mod tests {
             priority,
             queued_at: Utc::now() + chrono::Duration::milliseconds(offset_ms),
             child_jobs: 2,
+            attached_tx: None,
         }
     }
 

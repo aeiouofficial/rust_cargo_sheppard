@@ -89,13 +89,26 @@ impl ShepherdClient {
 
     /// Send one message and receive one response.
     pub async fn send_recv(&mut self, msg: &ClientMsg) -> Result<DaemonMsg> {
+        self.send(msg).await?;
+        self.recv().await
+    }
+
+    pub async fn send(&mut self, msg: &ClientMsg) -> Result<()> {
         let mut line = serde_json::to_string(msg)?;
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await?;
 
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Result<DaemonMsg> {
         let mut resp_line = String::new();
         self.reader.read_line(&mut resp_line).await?;
+
+        if resp_line.is_empty() {
+            return Err(anyhow::anyhow!("daemon closed the connection"));
+        }
 
         serde_json::from_str(resp_line.trim()).context("Failed to parse daemon response as JSON")
     }

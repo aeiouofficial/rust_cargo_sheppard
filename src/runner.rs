@@ -4,10 +4,12 @@
 // child_jobs controls CARGO_BUILD_JOBS (rustc thread count) per invocation.
 
 use anyhow::{Context, Result};
+use crate::ipc::{CargoOutputStream, DaemonMsg};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub struct CargoRunner {
@@ -22,12 +24,14 @@ impl CargoRunner {
         args: &[String],
         job_id: &str,
         child_jobs: usize,
+        attached_tx: Option<mpsc::UnboundedSender<DaemonMsg>>,
     ) -> Result<Self> {
         let dir = PathBuf::from(project_dir);
         let id = job_id.to_string();
         let cj_str = child_jobs.to_string();
 
-        let mut cmd = Command::new("cargo");
+        let cargo_path = resolve_real_cargo()?;
+        let mut cmd = Command::new(&cargo_path);
         cmd.args(args)
             .current_dir(&dir)
             .stdout(std::process::Stdio::piped())
@@ -56,9 +60,17 @@ impl CargoRunner {
         // Stream stdout (cargo puts most build output on stderr, but check output on stdout)
         if let Some(stdout) = child.stdout.take() {
             let id_clone = id.clone();
+            let output_tx = attached_tx.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(tx) = &output_tx {
+                        let _ = tx.send(DaemonMsg::CargoOutput {
+                            job_id: id_clone.clone(),
+                            stream: CargoOutputStream::Stdout,
+                            line: line.clone(),
+                        });
+                    }
                     info!(job = %id_clone, "{}", line);
                 }
             });
@@ -67,15 +79,23 @@ impl CargoRunner {
         // Stream stderr
         if let Some(stderr) = child.stderr.take() {
             let id_clone = id.clone();
+            let output_tx = attached_tx.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(tx) = &output_tx {
+                        let _ = tx.send(DaemonMsg::CargoOutput {
+                            job_id: id_clone.clone(),
+                            stream: CargoOutputStream::Stderr,
+                            line: line.clone(),
+                        });
+                    }
                     info!(job = %id_clone, "{}", line);
                 }
             });
         }
 
-        info!(job = %id, pid, ?dir, jobs = child_jobs, "cargo spawned");
+        info!(job = %id, pid, ?dir, ?cargo_path, jobs = child_jobs, "cargo spawned");
         Ok(Self { pid, child })
     }
 
@@ -99,6 +119,57 @@ impl CargoRunner {
             );
         }
     }
+}
+
+pub fn resolve_real_cargo() -> Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("SHEPHERD_REAL_CARGO") {
+        if !configured.as_os_str().is_empty() {
+            return Ok(PathBuf::from(configured));
+        }
+    }
+
+    find_real_cargo_on_path().context(
+        "Could not find the real Cargo executable. Set SHEPHERD_REAL_CARGO to the rustup/cargo path.",
+    )
+}
+
+fn find_real_cargo_on_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let current_exe = std::env::current_exe().ok().and_then(canonicalize_lossy);
+    let current_dir = current_exe
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(|path| canonicalize_lossy(path.to_path_buf()));
+    let extensions = executable_extensions("cargo");
+
+    for dir in std::env::split_paths(&path_var) {
+        for extension in &extensions {
+            let mut file_name = OsString::from("cargo");
+            file_name.push(extension);
+            let candidate = dir.join(file_name);
+            if !candidate.is_file() {
+                continue;
+            }
+
+            let canonical = canonicalize_lossy(candidate.clone()).unwrap_or(candidate);
+            if current_exe.as_ref() == Some(&canonical) {
+                continue;
+            }
+            if let (Some(parent), Some(current_dir)) = (canonical.parent(), current_dir.as_ref()) {
+                if canonicalize_lossy(parent.to_path_buf()).as_ref() == Some(current_dir) {
+                    continue;
+                }
+            }
+
+            return Some(canonical);
+        }
+    }
+
+    None
+}
+
+fn canonicalize_lossy(path: PathBuf) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 fn command_exists_on_path(command: &str) -> bool {

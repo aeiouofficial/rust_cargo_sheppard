@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info};
 
 use crate::config::{slot_limit_label, GlobalConfig};
-use crate::ipc::{ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, StatusReport};
+use crate::ipc::{ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, RunningJobSource, StatusReport};
 use crate::monitor::ResourceMonitor;
 use crate::queue::{PriorityQueue, QueuedJob};
 use crate::runner::CargoRunner;
@@ -59,20 +59,25 @@ impl SharedState {
 
         let queued = self.queue.snapshot();
         let now = Utc::now();
+        let managed_pids = self.managed_pids();
+
+        let mut running: Vec<RunningJob> = self
+            .running
+            .values()
+            .map(|entry| {
+                let mut job = entry.job.clone();
+                job.elapsed_ms = now
+                    .signed_duration_since(job.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                job
+            })
+            .collect();
+        running.extend(self.monitor.external_cargo_jobs(&managed_pids, &self.config));
 
         StatusReport {
-            running: self
-                .running
-                .values()
-                .map(|entry| {
-                    let mut job = entry.job.clone();
-                    job.elapsed_ms = now
-                        .signed_duration_since(job.started_at)
-                        .num_milliseconds()
-                        .max(0) as u64;
-                    job
-                })
-                .collect(),
+            slots_active: running.len(),
+            running,
             queued: queued
                 .iter()
                 .enumerate()
@@ -87,17 +92,30 @@ impl SharedState {
                 })
                 .collect(),
             slots_total: self.config.slots,
-            slots_active: self.active,
             cpu_pct: self.monitor.cpu_usage(),
             ram_pct: self.monitor.ram_usage_pct(),
         }
     }
 
     fn can_start_another(&mut self) -> bool {
-        (self.config.slots == 0 || self.active < self.config.slots)
+        let managed_pids = self.managed_pids();
+        let adopted_external = self
+            .monitor
+            .external_cargo_jobs(&managed_pids, &self.config)
+            .len();
+        let active_builds = self.active + adopted_external;
+
+        (self.config.slots == 0 || active_builds < self.config.slots)
             && self
                 .monitor
                 .can_start_build(self.config.max_cpu_pct, self.config.max_ram_pct)
+    }
+
+    fn managed_pids(&self) -> Vec<u32> {
+        self.running
+            .values()
+            .filter_map(|entry| (entry.job.pid > 0).then_some(entry.job.pid))
+            .collect()
     }
 
     fn request_kill_job(&mut self, job_id: &str) -> KillJobOutcome {
@@ -107,7 +125,11 @@ impl SharedState {
             JobIdResolution::NotFound => return KillJobOutcome::NotFound,
         };
 
-        if self.queue.remove(&resolved_id).is_some() {
+        if let Some(job) = self.queue.remove(&resolved_id) {
+            notify_attached_queued_job(
+                &job,
+                format!("Queued job {} was removed before it started", resolved_id),
+            );
             return KillJobOutcome::RemovedQueued;
         }
 
@@ -120,6 +142,21 @@ impl SharedState {
                 None => KillJobOutcome::AlreadyRequested,
             },
             None => KillJobOutcome::NotFound,
+        }
+    }
+
+    fn request_kill_external_job(&mut self, job_id: &str) -> KillJobOutcome {
+        let Some(pid_text) = job_id.strip_prefix("external-") else {
+            return KillJobOutcome::NotFound;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            return KillJobOutcome::NotFound;
+        };
+
+        if self.monitor.kill_external_cargo_pid(pid) {
+            KillJobOutcome::SignaledExternal
+        } else {
+            KillJobOutcome::NotFound
         }
     }
 
@@ -149,7 +186,11 @@ impl SharedState {
     fn cancel_queued_job(&mut self, job_id: &str) -> CancelJobOutcome {
         match self.resolve_job_id(job_id) {
             JobIdResolution::Found(resolved_id) => {
-                if self.queue.remove(&resolved_id).is_some() {
+                if let Some(job) = self.queue.remove(&resolved_id) {
+                    notify_attached_queued_job(
+                        &job,
+                        format!("Queued job {} was cancelled before it started", resolved_id),
+                    );
                     CancelJobOutcome::Cancelled(resolved_id)
                 } else if self.running.contains_key(&resolved_id) {
                     CancelJobOutcome::AlreadyRunning
@@ -194,7 +235,15 @@ impl SharedState {
     }
 
     fn request_kill_project(&mut self, project_dir: &str) -> (usize, usize) {
-        let removed_queued = self.queue.remove_project(project_dir).len();
+        let removed_queued_jobs = self.queue.remove_project(project_dir);
+        let removed_queued = removed_queued_jobs.len();
+
+        for job in &removed_queued_jobs {
+            notify_attached_queued_job(
+                job,
+                format!("Queued job {} was removed before it started", job.job_id),
+            );
+        }
 
         let running_ids: Vec<String> = self
             .running
@@ -213,6 +262,14 @@ impl SharedState {
             }
         }
 
+        let managed_pids = self.managed_pids();
+        let external_jobs = self.monitor.external_cargo_jobs(&managed_pids, &self.config);
+        for job in external_jobs {
+            if job.project_dir == project_dir && self.monitor.kill_external_cargo_pid(job.pid) {
+                killed_running += 1;
+            }
+        }
+
         (removed_queued, killed_running)
     }
 }
@@ -220,6 +277,7 @@ impl SharedState {
 enum KillJobOutcome {
     RemovedQueued,
     SignaledRunning,
+    SignaledExternal,
     AlreadyRequested,
     Ambiguous,
     NotFound,
@@ -243,6 +301,12 @@ enum JobIdResolution {
     Found(String),
     Ambiguous,
     NotFound,
+}
+
+fn notify_attached_queued_job(job: &QueuedJob, message: String) {
+    if let Some(tx) = &job.attached_tx {
+        let _ = tx.send(DaemonMsg::Error { message });
+    }
 }
 
 // ─────────────────────────── Daemon ──────────────────────────────────────────
@@ -371,8 +435,15 @@ async fn scheduler_loop(
     notify: Arc<Notify>,
     spawn_tx: mpsc::UnboundedSender<QueuedJob>,
 ) {
+    let mut resource_poll = tokio::time::interval(std::time::Duration::from_millis(1000));
+    resource_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    resource_poll.tick().await;
+
     loop {
-        notify.notified().await;
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = resource_poll.tick() => {}
+        }
 
         let mut s = state.lock().await;
         s.monitor.refresh();
@@ -414,6 +485,7 @@ async fn runner_pool(
             let args = queued_job.args.clone();
             let child_jobs = queued_job.child_jobs;
             let alias = queued_job.alias.clone();
+            let attached_tx = queued_job.attached_tx.clone();
 
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -431,6 +503,7 @@ async fn runner_pool(
                             pid: 0, // updated below
                             started_at: Utc::now(),
                             elapsed_ms: 0,
+                            source: RunningJobSource::Sheppard,
                         },
                         kill_tx: Some(kill_tx),
                     },
@@ -439,7 +512,7 @@ async fn runner_pool(
 
             let start = Instant::now();
 
-            match CargoRunner::spawn(&project_dir, &args, &job_id, child_jobs).await {
+            match CargoRunner::spawn(&project_dir, &args, &job_id, child_jobs, attached_tx.clone()).await {
                 Ok(mut runner) => {
                     // Update PID
                     {
@@ -447,6 +520,13 @@ async fn runner_pool(
                         if let Some(entry) = s.running.get_mut(&job_id) {
                             entry.job.pid = runner.pid;
                         }
+                    }
+
+                    if let Some(tx) = &attached_tx {
+                        let _ = tx.send(DaemonMsg::Started {
+                            job_id: job_id.clone(),
+                            pid: runner.pid,
+                        });
                     }
 
                     // Use a fuse-style pattern: pin the kill receiver
@@ -464,9 +544,22 @@ async fn runner_pool(
                         "Job {} finished (exit={}, {}ms)",
                         job_id, exit_code, duration_ms
                     );
+
+                    if let Some(tx) = &attached_tx {
+                        let _ = tx.send(DaemonMsg::Finished {
+                            job_id: job_id.clone(),
+                            exit_code,
+                            duration_ms,
+                        });
+                    }
                 }
                 Err(e) => {
                     error!("Failed to spawn job {}: {}", job_id, e);
+                    if let Some(tx) = &attached_tx {
+                        let _ = tx.send(DaemonMsg::Error {
+                            message: format!("Failed to spawn job {}: {}", job_id, e),
+                        });
+                    }
                 }
             }
 
@@ -536,6 +629,7 @@ where
                     priority: resolved_priority,
                     queued_at: Utc::now(),
                     child_jobs,
+                    attached_tx: None,
                 };
 
                 let position = {
@@ -544,8 +638,96 @@ where
                     s.queue.position_of(&job_id).unwrap_or(0)
                 };
 
-                send(&mut writer, &DaemonMsg::Queued { job_id, position }).await?;
+                send(
+                    &mut writer,
+                    &DaemonMsg::Queued {
+                        job_id: job_id.clone(),
+                        position,
+                    },
+                )
+                .await?;
                 notify.notify_one();
+            }
+
+            ClientMsg::RunAttached {
+                job_id,
+                project_dir,
+                args,
+                priority,
+            } => {
+                let attached_job_id = job_id.clone();
+                let (attached_tx, mut attached_rx) = mpsc::unbounded_channel();
+                let (resolved_priority, alias, child_jobs) = {
+                    let s = state.lock().await;
+                    let p = priority.unwrap_or_else(|| s.config.priority_for(&project_dir));
+                    let a = s.config.alias_for(&project_dir);
+                    let c = s.config.child_jobs_for(&project_dir);
+                    (p, a, c)
+                };
+
+                let job = QueuedJob {
+                    job_id: job_id.clone(),
+                    project_dir: project_dir.clone(),
+                    alias,
+                    args: args.clone(),
+                    priority: resolved_priority,
+                    queued_at: Utc::now(),
+                    child_jobs,
+                    attached_tx: Some(attached_tx),
+                };
+
+                let position = {
+                    let mut s = state.lock().await;
+                    s.queue.push(job);
+                    s.queue.position_of(&attached_job_id).unwrap_or(0)
+                };
+
+                send(
+                    &mut writer,
+                    &DaemonMsg::Queued {
+                        job_id: attached_job_id.clone(),
+                        position,
+                    },
+                )
+                .await?;
+                notify.notify_one();
+
+                loop {
+                    tokio::select! {
+                        msg = attached_rx.recv() => {
+                            let Some(msg) = msg else {
+                                return Ok(());
+                            };
+
+                            let terminal = matches!(msg, DaemonMsg::Finished { .. } | DaemonMsg::Error { .. });
+                            send(&mut writer, &msg).await?;
+                            if terminal {
+                                return Ok(());
+                            }
+                        }
+                        line = lines.next_line() => {
+                            match line? {
+                                Some(_) => {
+                                    let job_id_for_cancel = attached_job_id.clone();
+                                    cancel_queued_attached_job(&state, &notify, &job_id_for_cancel).await;
+                                    send(
+                                        &mut writer,
+                                        &DaemonMsg::Error {
+                                            message: "attached cargo connections do not accept additional messages".to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                None => {
+                                    let job_id_for_cancel = attached_job_id.clone();
+                                    cancel_queued_attached_job(&state, &notify, &job_id_for_cancel).await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // ── Reprioritize queued job ───────────────────────────────────────
@@ -665,7 +847,10 @@ where
             // ── Kill running job ──────────────────────────────────────────────
             ClientMsg::KillJob { job_id } => {
                 let mut s = state.lock().await;
-                let outcome = s.request_kill_job(&job_id);
+                let outcome = match s.request_kill_job(&job_id) {
+                    KillJobOutcome::NotFound => s.request_kill_external_job(&job_id),
+                    outcome => outcome,
+                };
                 drop(s);
 
                 match outcome {
@@ -684,6 +869,18 @@ where
                             &mut writer,
                             &DaemonMsg::Killed {
                                 description: format!("Kill requested for running job {}", job_id),
+                            },
+                        )
+                        .await?;
+                    }
+                    KillJobOutcome::SignaledExternal => {
+                        send(
+                            &mut writer,
+                            &DaemonMsg::Killed {
+                                description: format!(
+                                    "Kill requested for adopted external cargo job {}",
+                                    job_id
+                                ),
                             },
                         )
                         .await?;
@@ -902,6 +1099,21 @@ async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, msg: &DaemonMsg)
     Ok(())
 }
 
+async fn cancel_queued_attached_job(
+    state: &Arc<Mutex<SharedState>>,
+    notify: &Arc<Notify>,
+    job_id: &str,
+) {
+    let removed = {
+        let mut s = state.lock().await;
+        s.queue.remove(job_id).is_some()
+    };
+
+    if removed {
+        notify.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +1127,7 @@ mod tests {
             priority: crate::config::Priority::Normal,
             queued_at: Utc::now(),
             child_jobs: 2,
+            attached_tx: None,
         }
     }
 
@@ -959,6 +1172,7 @@ mod tests {
                     alias: "project".to_string(),
                     args: vec!["check".to_string()],
                     pid: 123,
+                    source: RunningJobSource::Sheppard,
                     started_at: Utc::now() - chrono::Duration::milliseconds(1250),
                     elapsed_ms: 0,
                 },
@@ -987,6 +1201,7 @@ mod tests {
                     alias: "project".to_string(),
                     args: vec!["check".to_string()],
                     pid: 123,
+                    source: RunningJobSource::Sheppard,
                     started_at: Utc::now(),
                     elapsed_ms: 0,
                 },

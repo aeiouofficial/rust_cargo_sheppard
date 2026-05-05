@@ -41,7 +41,11 @@ use tokio::time::interval;
 
 use crate::client::ShepherdClient;
 use crate::config::{slot_limit_label, Priority};
-use crate::ipc::{ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, StatusReport};
+use crate::ipc::{
+    ClientMsg, DaemonMsg, QueuedJobSnapshot, RunningJob, RunningJobSource, StatusReport,
+};
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Focus ─────────────────────────────────────────────────────────────────────
 
@@ -555,16 +559,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let logo_ascii = [
-        "  ____  _                      _               _ ",
-        " / ___|| |__   ___ _ __  _ __ | |__   ___ _ __| |",
-        " \\___ \\| '_ \\ / _ \\ '_ \\| '_ \\| '_ \\ / _ \\ '__| |",
-        "  ___) | | | |  __/ |_) | |_) | | | |  __/ |  |_|",
-        " |____/|_| |_|\\___| .__/| .__/|_| |_|\\___|_|  (_)",
-        "                  |_|   |_|                      ",
+        "  ____  _                                 _ ",
+        " / ___|| |__   ___ _ __  _ __   __ _ _ __ __| |",
+        " \\___ \\| '_ \\ / _ \\ '_ \\| '_ \\ / _` | '__/ _` |",
+        "  ___) | | | |  __/ |_) | |_) | (_| | | | (_| |",
+        " |____/|_| |_|\\___| .__/| .__/ \\__,_|_|  \\__,_|",
+        "                  |_|   |_|                        ",
     ];
 
     let header_layout = Layout::horizontal([
-        Constraint::Length(52), // Logo width
+        Constraint::Length(56), // Logo width
         Constraint::Min(0),     // Info
     ])
     .split(title_area);
@@ -576,10 +580,12 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(logo_p, header_layout[0]);
 
+    let version_text = format!(" 🐑 v{} ", APP_VERSION);
+
     let info_lines = vec![
         Line::from(vec![
             Span::styled(
-                " 🐑 v0.2.0 ",
+                version_text,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -702,6 +708,16 @@ fn render_running_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "PID:?".into()
             };
+            let source = match job.source {
+                RunningJobSource::Sheppard => "sheppard",
+                RunningJobSource::ExternalCargo => "external",
+            };
+            let source_style = match job.source {
+                RunningJobSource::Sheppard => Style::default().fg(Color::Green),
+                RunningJobSource::ExternalCargo => Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            };
 
             ListItem::new(vec![
                 Line::from(vec![
@@ -717,10 +733,12 @@ fn render_running_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Span::raw("  "),
+                    Span::styled(source, source_style),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(truncate(&cmd, 28), Style::default().fg(Color::Cyan)),
+                    Span::styled(truncate(&cmd, 34), Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![Span::styled(
                     format!("  {} · {}", pid, elapsed),

@@ -28,6 +28,9 @@ colored      = "2"
 toml         = "0.8"       # config file parsing
 dirs         = "5"         # XDG / platform-correct config paths
 
+[target.'cfg(windows)'.dependencies]
+winapi       = { version = "0.3", features = ["libloaderapi", "shellapi", "winuser"] }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TUI deps (always included — shepherd ui tui)
 # ──────────────────────────────────────────────────────────────────────────────
